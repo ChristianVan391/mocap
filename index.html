@@ -1,40 +1,19 @@
 <!--
   BACKUP NOTE
   Timestamp: 2026-08-21T00:00:00Z
-  Original single-file app backup: recommended to save the previous version as
-  mocap_bvh_original.bak or retain in version control before applying this patch.
+  This version removes all MiDaS scaling hacks and fixes the BVH coordinate math.
+  It uses BlazePose's native 3D world coordinates, canonicalizes the root coordinate
+  frame, computes rest offsets from the first frame, and writes local rotations
+  consistently with the BVH hierarchy.
 
-  README — Optional in-browser MiDaS metric-depth pipeline
-  --------------------------------------------------------
-  1. Set MIDAS_ONNX_URL below to a CORS-enabled hosted ONNX MiDaS model URL.
-     - The URL must allow browser CORS requests.
-     - Many MiDaS ONNX models expect square input. The default MIDAS_MODEL_SIZE is 256.
-     - To change inference resolution, edit MIDAS_MODEL_SIZE (256/384/512).
-  2. Open this HTML in a local web server (file:// may block CDN resources).
-  3. Load an MP4 and process it as usual. Original behavior is unchanged without MiDaS.
-  4. Optional metric pipeline:
-     - Check "Use MiDaS depth (ONNX) for metric scaling" (this triggers model loading).
-     - Ensure the camera horizontal FOV (deg) is correct.
-     - Click "Start Processing" then "Export BVH".
-     - The status box will report "Using MiDaS metric pipeline" or a fallback message.
-  5. No separate load, export/import buttons; only the toggle, FOV, and Export BVH.
+  USAGE
+  1. Open this HTML from a local web server.
+  2. Load an MP4.
+  3. Click "Start Processing".
+  4. Click "Export BVH".
+  5. Import the resulting BVH into Blender.
 
-  TEST PLAN (3-5 steps)
-  1. Open modified HTML locally via a web server. Load an MP4. Verify preview and
-     processing still work when MiDaS is not loaded.
-  2. Configure MIDAS_ONNX_URL to a valid CORS ONNX MiDaS model.
-  3. Check "Use MiDaS depth", run processing, then click Export BVH. Confirm status
-     shows "Using MiDaS metric pipeline" and a BVH file downloads.
-  4. Uncheck "Use MiDaS depth", process the same video, click Export BVH. Confirm
-     BVH export still works via the fallback relative BlazePose pipeline.
-  5. Verify no extra UI controls are present (only toggle, FOV, Export BVH).
-
-  Assumptions:
-  A. recordedFrames[].rawLandmarks2D contains MediaPipe/BlazePose 33-landmark list
-     in normalized coordinates (x,y in 0..1), same as current code.
-  B. Developer hosts an ONNX MiDaS model at MIDAS_ONNX_URL with CORS enabled.
-  C. Seeking video frames via video.currentTime + seeked event is acceptable for
-     depth estimation on CPU (slow).
+  The MiDaS checkbox is now a visible placeholder and does not affect output.
 -->
 
 <!DOCTYPE html>
@@ -214,7 +193,6 @@
     .info-row { display: flex; justify-content: space-between; font-size: 0.9rem; color: var(--text-dim); }
     .info-row span:last-child { color: var(--text); font-weight: 500; }
 
-    /* ADDED: MiDaS metric controls */
     .control-row {
       display: flex;
       align-items: center;
@@ -306,16 +284,15 @@
         </button>
       </div>
 
-      <!-- ADDED: MiDaS metric depth controls (simplified) -->
       <div class="section">
-        <div class="section-title">Metric Depth (MiDaS)</div>
+        <div class="section-title">Depth (optional)</div>
         <div class="control-row">
           <label for="cameraFovInput">Camera horiz. FOV (deg)</label>
           <input type="number" id="cameraFovInput" value="60" step="1" min="10" max="160" />
         </div>
         <label class="checkbox-row">
           <input type="checkbox" id="useMiDaSCheckbox" />
-          Use MiDaS depth (ONNX) for metric scaling
+          Use MiDaS depth (currently inactive)
         </label>
       </div>
 
@@ -349,13 +326,7 @@
   <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl"></script>
   <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose"></script>
-  
-  <!-- ONNX Runtime Web (runtime JS) - use local copy /libs/ort.min.js if you added it to the repo -->
-  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
-  <!-- fallback to CDN if you prefer:
-  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
-  -->
-  
+
   <script>
     // ==================== DOM Elements ====================
     const video = document.getElementById('video');
@@ -374,99 +345,42 @@
     const previewPlayBtn = document.getElementById('previewPlayBtn');
     const previewStopBtn = document.getElementById('previewStopBtn');
     const previewTime = document.getElementById('previewTime');
-  
-    // ADDED: MiDaS DOM elements
     const cameraFovInput = document.getElementById('cameraFovInput');
     const useMiDaSCheckbox = document.getElementById('useMiDaSCheckbox');
-  
+
     // ==================== State ====================
     let poseDetector;
     let processing = false;
     let isPreviewing = false;
     let recordedFrames = [];
     let previewFrameCallbackId = null;
-    let prevCleanedPose2D = null;   // array of 33 {x,y,confidence} or null
-    let prevCleanedPose3D = null;   // array of 33 {x,y,z,confidence} or null
+    let prevCleanedPose2D = null;
+    let prevCleanedPose3D = null;
     let stallTimeout = null;
-  
-    // ADDED: MiDaS state
-    let midasSession = null;
-    // Use a prebuilt hosted ONNX (Hugging Face). You can replace with your own same-origin URL later.
-    const MIDAS_ONNX_URL = 'https://huggingface.co/Heliosoph/midas-small-onnx/resolve/main/midas_v21_small_256.onnx';
-    const MIDAS_MODEL_SIZE = 256;   // input size you will render frames to before inference
-    const MIDAS_DEPTH_SUBSET = 30;  // number of frames used to estimate global scale
-  
-    // Minimal loader: fetch the .onnx as ArrayBuffer then create ort.InferenceSession
-    async function loadMiDaS(url) {
-      if (!window.ort) throw new Error('onnxruntime-web (ort) not loaded; make sure ort.min.js is included.');
-      statusEl && (statusEl.textContent = 'Fetching MiDaS model...');
-      try {
-        const res = await fetch(url);
-        if (!res.ok) throw new Error('Fetch failed: ' + res.status + ' ' + res.statusText);
-        const buffer = await res.arrayBuffer();
-        // try WebGPU first (if supported), fallback to WASM
-        let session = null;
-        try {
-          session = await ort.InferenceSession.create(buffer, { executionProviders: ['webgpu'] });
-          console.log('MiDaS loaded with WebGPU');
-        } catch (e) {
-          console.warn('WebGPU load failed, falling back to WASM', e);
-          session = await ort.InferenceSession.create(buffer, { executionProviders: ['wasm'] });
-          console.log('MiDaS loaded with WASM');
-        }
-        midasSession = session;
-        statusEl && (statusEl.textContent = 'MiDaS model loaded');
-        console.log('MiDaS session inputNames:', session.inputNames, 'inputMetadata:', session.inputMetadata);
-        return session;
-      } catch (err) {
-        console.error('Failed to load MiDaS model', err);
-        midasSession = null;
-        statusEl && (statusEl.textContent = 'MiDaS load error: ' + (err.message || err));
-        throw err;
-      }
-    }
-  
-    // When user toggles the checkbox we lazy-load the model
-    if (useMiDaSCheckbox) {
-      useMiDaSCheckbox.addEventListener('change', async (ev) => {
-        const enabled = ev.target.checked;
-        if (enabled) {
-          try {
-            await loadMiDaS(MIDAS_ONNX_URL);
-          } catch (e) {
-            // disable checkbox on error
-            ev.target.checked = false;
-          }
-        } else {
-          midasSession = null;
-          statusEl && (statusEl.textContent = 'MiDaS disabled');
-        }
-      });
-    }
 
-    // Skeleton hierarchy (with feet)
+    // ==================== Skeleton Hierarchy ====================
     const SKELETON_HIERARCHY = [
-      { name: 'pelvis', parent: null, sources: [23, 24], type: 'midpoint' },
-      { name: 'left_hip', parent: 'pelvis', sources: [23], type: 'landmark' },
-      { name: 'left_knee', parent: 'left_hip', sources: [25], type: 'landmark' },
-      { name: 'left_ankle', parent: 'left_knee', sources: [27], type: 'landmark' },
-      { name: 'left_foot', parent: 'left_ankle', sources: [31], type: 'landmark' },
-      { name: 'right_hip', parent: 'pelvis', sources: [24], type: 'landmark' },
-      { name: 'right_knee', parent: 'right_hip', sources: [26], type: 'landmark' },
-      { name: 'right_ankle', parent: 'right_knee', sources: [28], type: 'landmark' },
-      { name: 'right_foot', parent: 'right_ankle', sources: [32], type: 'landmark' },
-      { name: 'chest', parent: 'pelvis', sources: [11, 12], type: 'midpoint' },
-      { name: 'left_shoulder', parent: 'chest', sources: [11], type: 'landmark' },
-      { name: 'left_elbow', parent: 'left_shoulder', sources: [13], type: 'landmark' },
-      { name: 'left_wrist', parent: 'left_elbow', sources: [15], type: 'landmark' },
-      { name: 'right_shoulder', parent: 'chest', sources: [12], type: 'landmark' },
-      { name: 'right_elbow', parent: 'right_shoulder', sources: [14], type: 'landmark' },
-      { name: 'right_wrist', parent: 'right_elbow', sources: [16], type: 'landmark' },
-      { name: 'neck', parent: 'chest', sources: ['chest', 'head'], type: 'derived' },
-      { name: 'head', parent: 'neck', sources: [0], type: 'landmark' },
+      { name: 'pelvis', parent: null },
+      { name: 'left_hip', parent: 'pelvis' },
+      { name: 'left_knee', parent: 'left_hip' },
+      { name: 'left_ankle', parent: 'left_knee' },
+      { name: 'left_foot', parent: 'left_ankle' },
+      { name: 'right_hip', parent: 'pelvis' },
+      { name: 'right_knee', parent: 'right_hip' },
+      { name: 'right_ankle', parent: 'right_knee' },
+      { name: 'right_foot', parent: 'right_ankle' },
+      { name: 'chest', parent: 'pelvis' },
+      { name: 'left_shoulder', parent: 'chest' },
+      { name: 'left_elbow', parent: 'left_shoulder' },
+      { name: 'left_wrist', parent: 'left_elbow' },
+      { name: 'right_shoulder', parent: 'chest' },
+      { name: 'right_elbow', parent: 'right_shoulder' },
+      { name: 'right_wrist', parent: 'right_elbow' },
+      { name: 'neck', parent: 'chest' },
+      { name: 'head', parent: 'neck' },
     ];
 
-    // Confidence thresholds
+    // ==================== Confidence Thresholds ====================
     const HIGH_CONFIDENCE = 0.5;
     const LOW_CONFIDENCE = 0.2;
     const GLOBAL_AVERAGE_CONFIDENCE_THRESHOLD = 0.3;
@@ -606,14 +520,12 @@
         statusEl.className = 'status-box error';
         return;
       }
-
       prevCleanedPose2D = null;
       prevCleanedPose3D = null;
       isPreviewing = true;
       previewPlayBtn.textContent = 'Pause';
       statusEl.textContent = 'Preview mode: skeleton tracking running...';
       statusEl.className = 'status-box';
-
       try {
         await video.play();
         previewFrameCallbackId = video.requestVideoFrameCallback(previewLoop);
@@ -650,11 +562,7 @@
         return { landmarks: prevCleanedPose2D, valid: false };
       }
       if (!prevCleanedPose2D) {
-        prevCleanedPose2D = rawKeypoints.map(kp => ({
-          x: kp.x,
-          y: kp.y,
-          confidence: kp.score ?? 0
-        }));
+        prevCleanedPose2D = rawKeypoints.map(kp => ({ x: kp.x, y: kp.y, confidence: kp.score ?? 0 }));
         return { landmarks: prevCleanedPose2D, valid: true };
       }
       const cleaned = rawKeypoints.map((kp, i) => {
@@ -690,12 +598,7 @@
         return { landmarks: prevCleanedPose3D, valid: false };
       }
       if (!prevCleanedPose3D) {
-        prevCleanedPose3D = rawKeypoints3D.map(kp => ({
-          x: kp.x,
-          y: kp.y,
-          z: kp.z,
-          confidence: kp.score ?? 0
-        }));
+        prevCleanedPose3D = rawKeypoints3D.map(kp => ({ x: kp.x, y: kp.y, z: kp.z, confidence: kp.score ?? 0 }));
         return { landmarks: prevCleanedPose3D, valid: true };
       }
       const cleaned = rawKeypoints3D.map((kp, i) => {
@@ -717,7 +620,7 @@
       return { landmarks: cleaned, valid: true };
     }
 
-    // ==================== Skeleton Computation (2D and 3D) ====================
+    // ==================== Skeleton Computation ====================
     function computeSkeletonGeneric(landmarks, globalValid, is3D) {
       if (!landmarks || landmarks.length === 0) return [];
       const joints = [];
@@ -738,16 +641,14 @@
             name,
             position: lm ? (is3D ? { x: lm.x, y: lm.y, z: lm.z } : { x: lm.x, y: lm.y }) : null,
             confidence: lm ? lm.confidence : 0,
-            valid: false,
-            parent: SKELETON_HIERARCHY.find(j => j.name === name)?.parent || null
+            valid: false
           });
         } else {
           joints.push({
             name,
             position: is3D ? { x: lm.x, y: lm.y, z: lm.z } : { x: lm.x, y: lm.y },
             confidence: lm.confidence,
-            valid: true,
-            parent: SKELETON_HIERARCHY.find(j => j.name === name)?.parent || null
+            valid: true
           });
         }
         jointByName[name] = joints[joints.length - 1];
@@ -761,66 +662,56 @@
         let confidence = 0;
         let valid = true;
 
-        if (spec.type === 'midpoint') {
-          const idxs = spec.sources;
-          const pts = idxs.map(idx => landmarks[idx]).filter(p => p && p.confidence >= LOW_CONFIDENCE);
-          if (pts.length === 2 && globalValid) {
-            if (is3D) {
-              position = {
-                x: (pts[0].x + pts[1].x) / 2,
-                y: (pts[0].y + pts[1].y) / 2,
-                z: (pts[0].z + pts[1].z) / 2
-              };
-            } else {
-              position = {
-                x: (pts[0].x + pts[1].x) / 2,
-                y: (pts[0].y + pts[1].y) / 2
-              };
-            }
-            confidence = (pts[0].confidence + pts[1].confidence) / 2;
+        if (name === 'pelvis') {
+          const lHip = landmarks[23], rHip = landmarks[24];
+          if (lHip && rHip && lHip.confidence >= LOW_CONFIDENCE && rHip.confidence >= LOW_CONFIDENCE && globalValid) {
+            position = is3D
+              ? { x: (lHip.x + rHip.x) / 2, y: (lHip.y + rHip.y) / 2, z: (lHip.z + rHip.z) / 2 }
+              : { x: (lHip.x + rHip.x) / 2, y: (lHip.y + rHip.y) / 2 };
+            confidence = (lHip.confidence + rHip.confidence) / 2;
             valid = true;
           } else {
             valid = false;
-            if (pts.length > 0) {
-              position = is3D ? { x: pts[0].x, y: pts[0].y, z: pts[0].z } : { x: pts[0].x, y: pts[0].y };
-              confidence = pts[0].confidence;
+            if (lHip && lHip.confidence >= LOW_CONFIDENCE) {
+              position = is3D ? { x: lHip.x, y: lHip.y, z: lHip.z } : { x: lHip.x, y: lHip.y };
+              confidence = lHip.confidence;
             }
           }
-        } else if (spec.type === 'derived') {
-          const srcA = jointByName[spec.sources[0]];
-          const srcB = jointByName[spec.sources[1]];
-          if (srcA && srcB && srcA.valid && srcB.valid && globalValid) {
-            if (is3D) {
-              position = {
-                x: (srcA.position.x + srcB.position.x) / 2,
-                y: (srcA.position.y + srcB.position.y) / 2,
-                z: (srcA.position.z + srcB.position.z) / 2
-              };
-            } else {
-              position = {
-                x: (srcA.position.x + srcB.position.x) / 2,
-                y: (srcA.position.y + srcB.position.y) / 2
-              };
-            }
-            confidence = (srcA.confidence + srcB.confidence) / 2;
+        } else if (name === 'chest') {
+          const lShoulder = landmarks[11], rShoulder = landmarks[12];
+          if (lShoulder && rShoulder && lShoulder.confidence >= LOW_CONFIDENCE && rShoulder.confidence >= LOW_CONFIDENCE && globalValid) {
+            position = is3D
+              ? { x: (lShoulder.x + rShoulder.x) / 2, y: (lShoulder.y + rShoulder.y) / 2, z: (lShoulder.z + rShoulder.z) / 2 }
+              : { x: (lShoulder.x + rShoulder.x) / 2, y: (lShoulder.y + rShoulder.y) / 2 };
+            confidence = (lShoulder.confidence + rShoulder.confidence) / 2;
             valid = true;
           } else {
             valid = false;
-            if (srcA && srcA.position) {
-              position = is3D ? { ...srcA.position } : { ...srcA.position };
-              confidence = srcA.confidence;
-            } else if (srcB && srcB.position) {
-              position = is3D ? { ...srcB.position } : { ...srcB.position };
-              confidence = srcB.confidence;
-            }
+          }
+        } else if (name === 'neck') {
+          const chest = jointByName['chest'];
+          const head = jointByName['head'];
+          if (chest && head && chest.valid && head.valid && globalValid) {
+            position = is3D
+              ? { x: (chest.position.x + head.position.x) / 2, y: (chest.position.y + head.position.y) / 2, z: (chest.position.z + head.position.z) / 2 }
+              : { x: (chest.position.x + head.position.x) / 2, y: (chest.position.y + head.position.y) / 2 };
+            confidence = (chest.confidence + head.confidence) / 2;
+            valid = true;
+          } else {
+            valid = false;
           }
         }
 
-        joints.push({ name, position, confidence, valid, parent: spec.parent });
-        jointByName[name] = joints[joints.length - 1];
+        if (position) {
+          joints.push({ name, position, confidence, valid });
+          jointByName[name] = joints[joints.length - 1];
+        }
       }
 
-      return SKELETON_HIERARCHY.map(spec => joints.find(j => j.name === spec.name)).filter(Boolean);
+      return SKELETON_HIERARCHY.map(spec => {
+        const j = joints.find(j => j.name === spec.name);
+        return j ? { ...j, parent: spec.parent } : { name: spec.name, position: null, confidence: 0, valid: false, parent: spec.parent };
+      }).filter(Boolean);
     }
 
     function computeSkeleton2D(landmarks, globalValid) {
@@ -980,7 +871,6 @@
           const skeleton2D = computeSkeleton2D(cleanResult2D.landmarks, cleanResult2D.valid);
           const skeleton3D = computeSkeleton3D(cleanResult3D.landmarks, cleanResult3D.valid);
 
-          // Store cleaned landmarks for potential MiDaS scaling
           const frameData = {
             time: timeSec,
             skeleton2D: skeleton2D,
@@ -1020,7 +910,7 @@
         });
     }
 
-    // ==================== Skeleton Preview Drawing (2D) ====================
+    // ==================== Skeleton Preview Drawing ====================
     function drawSkeletonPreview(skeleton, frameValid) {
       if (video.readyState >= 2) {
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
@@ -1067,9 +957,8 @@
       });
     }
 
-    // ==================== BVH Export (Uses 3D keypoints with proper conversion) ====================
-    const TARGET_HEIGHT = 1.7;
-
+    // ==================== BVH Math Utilities ====================
+    // Primitive vector and quaternion helpers preserved from the existing application.
     function vec3(x,y,z) { return {x,y,z}; }
     function vecSub(a,b) { return vec3(a.x-b.x, a.y-b.y, a.z-b.z); }
     function vecScale(a,s) { return vec3(a.x*s, a.y*s, a.z*s); }
@@ -1111,7 +1000,6 @@
       return {w:q.w/l, x:q.x/l, y:q.y/l, z:q.z/l};
     }
     function quatFromBasis(xAxis, yAxis, zAxis) {
-      // Build rotation matrix from basis vectors and convert to quaternion
       const m00 = xAxis.x, m01 = yAxis.x, m02 = zAxis.x;
       const m10 = xAxis.y, m11 = yAxis.y, m12 = zAxis.y;
       const m20 = xAxis.z, m21 = yAxis.z, m22 = zAxis.z;
@@ -1150,39 +1038,9 @@
           z: 0.25 * s
         };
       }
-      // Normalize
       const l = Math.sqrt(q.w*q.w + q.x*q.x + q.y*q.y + q.z*q.z);
       if (l < 1e-10) return quatIdentity();
       return {w:q.w/l, x:q.x/l, y:q.y/l, z:q.z/l};
-    }
-    function quatToEulerZXY(q) {
-      const x=q.x, y=q.y, z=q.z, w=q.w;
-      const x2=x+x, y2=y+y, z2=z+z;
-      const xx=x*x2, xy=x*y2, xz=x*z2;
-      const yy=y*y2, yz=y*z2, zz=z*z2;
-      const wx=w*x2, wy=w*y2, wz=w*z2;
-
-      const m00 = 1 - (yy + zz);
-      const m01 = xy - wz;
-      const m02 = xz + wy;
-      const m10 = xy + wz;
-      const m11 = 1 - (xx + zz);
-      const m12 = yz - wx;
-      const m20 = xz - wy;
-      const m21 = yz + wx;
-      const m22 = 1 - (xx + yy);
-
-      let sx, sy, sz;
-      sy = Math.asin(Math.max(-1, Math.min(1, m20)));
-      if (Math.abs(m20) < 0.99999) {
-        sx = Math.atan2(-m21, m22);
-        sz = Math.atan2(-m10, m00);
-      } else {
-        sx = Math.atan2(m12, m11);
-        sz = 0;
-      }
-      const radToDeg = 180/Math.PI;
-      return { x: sx*radToDeg, y: sy*radToDeg, z: sz*radToDeg };
     }
 
     function median(arr) {
@@ -1192,642 +1050,1164 @@
       return sorted.length % 2 ? sorted[mid] : (sorted[mid-1]+sorted[mid])/2;
     }
 
-    // BlazePose to BVH coordinate conversion:
-    // BlazePose: +x = right, +y = up, +z = toward camera
-    // BVH/Blender: +x = left, +y = up, +z = forward
-    function blazePoseToBVH(v) {
-      return vec3(-v.x, -v.y, v.z);
-    }
+    // ==================== BVH Math Utilities ====================
 
-    // ==================== Improved World Frame Construction ====================
-    function buildWorldFramesFromBlazePose() {
-      // Use recorded frames with cleaned 3D landmarks.
-      // Convert to BVH coordinate system and scale to target height.
-      const worldFrames = recordedFrames.map(frame => {
-        const joints = {};
-        if (frame.skeleton3D) {
-          frame.skeleton3D.forEach(j => {
-            if (j.position) {
-              joints[j.name] = blazePoseToBVH(vec3(j.position.x, j.position.y, j.position.z));
-            } else {
-              joints[j.name] = null;
-            }
-          });
-        }
-        return { time: frame.time, joints, rawLandmarks2D: frame.rawLandmarks2D, rawLandmarks3D: frame.rawLandmarks3D };
-      });
-
-      // Scale based on median head-ankle distance in BlazePose 3D units.
-      const heights = [];
-      worldFrames.forEach(wf => {
-        const head = wf.joints['head'];
-        const ankle = wf.joints['left_ankle'] || wf.joints['right_ankle'];
-        if (head && ankle) {
-          const h = vecLength(vecSub(head, ankle));
-          if (h > 0) heights.push(h);
-        }
-      });
-      if (!heights.length) return null;
-      const medianHeight = median(heights);
-      if (medianHeight < 1e-6) return null;
-      const scale3D = TARGET_HEIGHT / medianHeight;
-
-      worldFrames.forEach(wf => {
-        for (const name in wf.joints) {
-          if (wf.joints[name]) {
-            const v = wf.joints[name];
-            wf.joints[name] = vec3(v.x * scale3D, v.y * scale3D, v.z * scale3D);
-          }
-        }
-      });
-
-      // Root translation from pelvis movement
-      const firstPelvis = worldFrames[0].joints['pelvis'];
-      if (firstPelvis) {
-        worldFrames.forEach(wf => {
-          if (wf.joints['pelvis']) {
-            wf.rootTranslation = vecSub(wf.joints['pelvis'], firstPelvis);
-          } else {
-            wf.rootTranslation = vec3(0,0,0);
-          }
-        });
-      }
-
-      // Smooth joints (including root translation) using OneEuro
-      return smoothWorldFrames(worldFrames);
-    }
-
-    // ==================== MiDaS global scale estimation ====================
-    async function estimateGlobalScaleFromMiDaS(recordedFrames, session) {
-      // Use head-ankle depth difference in a subset of frames to compute scaling factor.
-      const validFrames = recordedFrames.filter(f => f.rawLandmarks2D && f.rawLandmarks2D[0] && (f.rawLandmarks2D[27] || f.rawLandmarks2D[28]));
-      if (!validFrames.length || !session) return null;
-
-      const subsetSize = Math.min(MIDAS_DEPTH_SUBSET, validFrames.length);
-      const step = Math.max(1, Math.floor(validFrames.length / subsetSize));
-      const scaleFactors = [];
-
-      for (let i = 0; i < validFrames.length && scaleFactors.length < subsetSize; i += step) {
-        const frame = validFrames[i];
-        try {
-          await seekVideoToTime(video, frame.time);
-          const depthObj = await estimateDepthMapONNXForVideoFrame(video, session, MIDAS_MODEL_SIZE);
-          const head = frame.rawLandmarks2D[0];
-          let ankle = frame.rawLandmarks2D[27];
-          if (!ankle || ankle.score < LOW_CONFIDENCE) ankle = frame.rawLandmarks2D[28];
-          if (!ankle || head.score < LOW_CONFIDENCE) continue;
-
-          const dHead = sampleDepth(depthObj, head.x, head.y);
-          const dAnkle = sampleDepth(depthObj, ankle.x, ankle.y);
-          if (dHead == null || dAnkle == null || !Number.isFinite(dHead) || !Number.isFinite(dAnkle)) continue;
-          const diff = Math.abs(dHead - dAnkle);
-          if (diff < 1e-6) continue;
-
-          // Assuming depth is relative, the scale factor converts relative depth difference to meters.
-          // We use known human height (TARGET_HEIGHT) and the depth difference to compute scale.
-          // Actually, diff is in relative depth units, not meters. We need a factor to convert.
-          // Since BlazePose 3D already gives a scale in its own units, we could instead scale BlazePose by this factor.
-          // But our BlazePose world frames are already scaled to TARGET_HEIGHT via median height.
-          // We could use MiDaS to refine the scale, but for simplicity we use a constant factor.
-          // In this version, we treat the depth difference as proportional to height, so scale = TARGET_HEIGHT / diff.
-          // Then we multiply all BlazePose joint coordinates by this scale.
-          scaleFactors.push(TARGET_HEIGHT / diff);
-        } catch (err) {
-          console.debug('MiDaS scale sample failed:', err);
-        }
-      }
-
-      if (!scaleFactors.length) return null;
-      return median(scaleFactors);
-    }
-
-    // MiDaS ONNX estimator with letterboxing and inverse-depth conversion
-    async function estimateDepthMapONNXForVideoFrame(videoEl, session, modelSize = 256) {
-      if (!videoEl || !session || !window.ort) {
-        throw new Error('MiDaS estimator or session not available');
-      }
-      if (!videoEl.videoWidth || !videoEl.videoHeight) {
-        throw new Error('Video dimensions not ready');
-      }
-
-      // Reuse a small offscreen canvas for model input
-      if (!window._midasCanvas) {
-        window._midasCanvas = document.createElement('canvas');
-        window._midasCtx = window._midasCanvas.getContext('2d');
-      }
-      const mc = window._midasCanvas;
-      const mctx = window._midasCtx;
-      if (mc.width !== modelSize) mc.width = modelSize;
-      if (mc.height !== modelSize) mc.height = modelSize;
-
-      // Letterboxing
-      const vw = videoEl.videoWidth;
-      const vh = videoEl.videoHeight;
-      const scale = Math.min(modelSize / vw, modelSize / vh);
-      const w = Math.round(vw * scale);
-      const h = Math.round(vh * scale);
-      const dx = (modelSize - w) / 2;
-      const dy = (modelSize - h) / 2;
-      mctx.fillStyle = '#000';
-      mctx.fillRect(0, 0, modelSize, modelSize);
-      mctx.drawImage(videoEl, dx, dy, w, h);
-
-      const imageData = mctx.getImageData(0, 0, modelSize, modelSize);
-      const data = imageData.data;
-      const chw = new Float32Array(3 * modelSize * modelSize);
-      const mean = [0.485, 0.456, 0.406];
-      const std = [0.229, 0.224, 0.225];
-      const area = modelSize * modelSize;
-      for (let i = 0; i < area; i++) {
-        chw[i] = (data[i * 4] / 255 - mean[0]) / std[0];
-        chw[area + i] = (data[i * 4 + 1] / 255 - mean[1]) / std[1];
-        chw[2 * area + i] = (data[i * 4 + 2] / 255 - mean[2]) / std[2];
-      }
-
-      const inputName = session.inputNames[0];
-      const inputTensor = new ort.Tensor('float32', chw, [1, 3, modelSize, modelSize]);
-      const feeds = { [inputName]: inputTensor };
-      const results = await session.run(feeds);
-      const outputName = session.outputNames[0];
-      const output = results[outputName];
-      if (!output) throw new Error('MiDaS ONNX output missing');
-
-      const dims = output.dims || [];
-      let H = modelSize, W = modelSize;
-      if (dims.length >= 4) { H = dims[2]; W = dims[3]; }
-      else if (dims.length === 3) { H = dims[1]; W = dims[2]; }
-      else if (dims.length === 2) { H = dims[0]; W = dims[1]; }
-
-      const flat = new Float32Array(output.data);
-      let start = flat.length - H * W;
-      if (start < 0) start = 0;
-      const modelMap = flat.slice(start, start + H * W);
-
-      // Convert to relative depth (inverse if needed)
-      let minVal = Infinity, maxVal = -Infinity;
-      for (let i = 0; i < modelMap.length; i++) {
-        const v = modelMap[i];
-        if (v < minVal) minVal = v;
-        if (v > maxVal) maxVal = v;
-      }
-      if (maxVal - minVal < 1e-6) {
-        // degenerate
-        const depthMap = new Float32Array(modelMap.length).fill(1.0);
-        return { data: depthMap, width: vw, height: vh };
-      }
-      const normalized = new Float32Array(modelMap.length);
-      for (let i = 0; i < modelMap.length; i++) {
-        normalized[i] = (modelMap[i] - minVal) / (maxVal - minVal);
-      }
-      const eps = 1e-3;
-      const depthModel = new Float32Array(modelMap.length);
-      for (let i = 0; i < modelMap.length; i++) {
-        depthModel[i] = 1.0 / (normalized[i] + eps);
-      }
-
-      // Upsample to full resolution
-      const outData = new Float32Array(vw * vh);
-      const scaleX = vw / w;
-      const scaleY = vh / h;
-      for (let y = 0; y < vh; y++) {
-        const py = dy + y * scaleY;
-        const y0 = Math.floor(py);
-        const y1 = Math.min(H - 1, y0 + 1);
-        const dyFrac = py - y0;
-        if (y0 < 0 || y0 >= H) continue;
-        for (let x = 0; x < vw; x++) {
-          const px = dx + x * scaleX;
-          const x0 = Math.floor(px);
-          const x1 = Math.min(W - 1, x0 + 1);
-          const dxFrac = px - x0;
-          if (x0 < 0 || x0 >= W) continue;
-          const i00 = y0 * W + x0;
-          const i10 = y0 * W + x1;
-          const i01 = y1 * W + x0;
-          const i11 = y1 * W + x1;
-          outData[y * vw + x] =
-            depthModel[i00] * (1 - dxFrac) * (1 - dyFrac) +
-            depthModel[i10] * dxFrac * (1 - dyFrac) +
-            depthModel[i01] * (1 - dxFrac) * dyFrac +
-            depthModel[i11] * dxFrac * dyFrac;
-        }
-      }
-
-      return { data: outData, width: vw, height: vh };
-    }
-
-    /* MiDaS video seek helper */
-    function seekVideoToTime(videoEl, timeSec) {
-      return new Promise((resolve, reject) => {
-        const target = Math.min(Math.max(timeSec, 0), videoEl.duration || 0);
-        if (Math.abs(videoEl.currentTime - target) < 1e-4) {
-          resolve();
-          return;
-        }
-        const onSeeked = () => { cleanup(); resolve(); };
-        const onError = () => { cleanup(); reject(new Error('seek failed')); };
-        const timeout = setTimeout(() => { cleanup(); reject(new Error('seek timeout')); }, 5000);
-        const cleanup = () => {
-          clearTimeout(timeout);
-          videoEl.removeEventListener('seeked', onSeeked);
-          videoEl.removeEventListener('error', onError);
-        };
-        videoEl.addEventListener('seeked', onSeeked);
-        videoEl.addEventListener('error', onError);
-        videoEl.currentTime = target;
-      });
-    }
-
-    function sampleDepth(depthObj, u, v) {
-      if (!depthObj || !depthObj.data || !depthObj.width || !depthObj.height) return null;
-      const x = Math.min(depthObj.width - 1, Math.max(0, u * depthObj.width - 0.5));
-      const y = Math.min(depthObj.height - 1, Math.max(0, v * depthObj.height - 0.5));
-      const x0 = Math.floor(x), y0 = Math.floor(y);
-      const x1 = Math.min(depthObj.width - 1, x0 + 1);
-      const y1 = Math.min(depthObj.height - 1, y0 + 1);
-      const dx = x - x0, dy = y - y0;
-      const i00 = y0 * depthObj.width + x0;
-      const i10 = y0 * depthObj.width + x1;
-      const i01 = y1 * depthObj.width + x0;
-      const i11 = y1 * depthObj.width + x1;
-      return (
-        depthObj.data[i00] * (1 - dx) * (1 - dy) +
-        depthObj.data[i10] * dx * (1 - dy) +
-        depthObj.data[i01] * (1 - dx) * dy +
-        depthObj.data[i11] * dx * dy
+    // BlazePose world coordinates:
+    //   X = subject's right
+    //   Y = up
+    //   Z = depth, with camera-facing direction represented by negative Z.
+    //
+    // BVH/Blender coordinates used here:
+    //   X = right
+    //   Y = forward
+    //   Z = up
+    //
+    // This is the ONE coordinate-system conversion used by the BVH pipeline.
+    // No canonical-frame rotation is applied afterward.
+    function blazeToBVH(p) {
+      if (!p) return null;
+      return vec3(
+        p.x,
+        -p.z,
+        p.y
       );
     }
 
-    // ==================== Improved Rest Offsets (Parent-local space) ====================
-    function calculateRestOffsets(worldFrames) {
-      if (!worldFrames || worldFrames.length === 0) return {};
-      const first = worldFrames[0];
-      const restOffsets = {};
-      const parentWorldRot = { pelvis: quatIdentity() };
+    function finiteVec3(v) {
+      return !!v &&
+        Number.isFinite(v.x) &&
+        Number.isFinite(v.y) &&
+        Number.isFinite(v.z);
+    }
 
-      // Compute root rotation for the first frame (or set to identity)
-      const rootQuat = calculateRootRotation(first);
-      parentWorldRot['pelvis'] = rootQuat;
+    function safeVec3(v, fallback) {
+      return finiteVec3(v) ? v : (fallback ? vec3(fallback.x, fallback.y, fallback.z) : null);
+    }
+
+    function quatNormalize(q) {
+      const l = Math.sqrt(
+        q.w*q.w + q.x*q.x + q.y*q.y + q.z*q.z
+      );
+      if (!Number.isFinite(l) || l < 1e-10) {
+        return quatIdentity();
+      }
+      return {
+        w: q.w / l,
+        x: q.x / l,
+        y: q.y / l,
+        z: q.z / l
+      };
+    }
+
+    function quatInverse(q) {
+      const n =
+        q.w*q.w +
+        q.x*q.x +
+        q.y*q.y +
+        q.z*q.z;
+
+      if (!Number.isFinite(n) || n < 1e-12) {
+        return quatIdentity();
+      }
+
+      return {
+        w: q.w / n,
+        x: -q.x / n,
+        y: -q.y / n,
+        z: -q.z / n
+      };
+    }
+
+    function quatSlerp(a, b, t) {
+      a = quatNormalize(a);
+      b = quatNormalize(b);
+
+      let dot =
+        a.w*b.w +
+        a.x*b.x +
+        a.y*b.y +
+        a.z*b.z;
+
+      if (dot < 0) {
+        b = {
+          w: -b.w,
+          x: -b.x,
+          y: -b.y,
+          z: -b.z
+        };
+        dot = -dot;
+      }
+
+      dot = Math.max(-1, Math.min(1, dot));
+
+      if (dot > 0.9995) {
+        return quatNormalize({
+          w: a.w + t*(b.w-a.w),
+          x: a.x + t*(b.x-a.x),
+          y: a.y + t*(b.y-a.y),
+          z: a.z + t*(b.z-a.z)
+        });
+      }
+
+      const theta = Math.acos(dot);
+      const sinTheta = Math.sin(theta);
+
+      if (Math.abs(sinTheta) < 1e-8) {
+        return a;
+      }
+
+      const wa = Math.sin((1-t)*theta) / sinTheta;
+      const wb = Math.sin(t*theta) / sinTheta;
+
+      return {
+        w: wa*a.w + wb*b.w,
+        x: wa*a.x + wb*b.x,
+        y: wa*a.y + wb*b.y,
+        z: wa*a.z + wb*b.z
+      };
+    }
+
+    // Build a right-handed orientation frame.
+    //
+    // Y is the primary anatomical axis.
+    // reference is used to establish the twist around Y.
+    //
+    // The returned quaternion maps the joint's local axes
+    // into the BVH/world coordinate system.
+    function quatFromPrimaryAxis(primaryY, reference) {
+      const y = vecNormalize(primaryY);
+
+      if (vecLength(y) < 1e-8) {
+        return quatIdentity();
+      }
+
+      let x = vecSub(
+        reference,
+        vecScale(y, vecDot(reference, y))
+      );
+
+      if (vecLength(x) < 1e-8) {
+        // Find a stable perpendicular axis.
+        const candidate =
+          Math.abs(y.z) < 0.8
+            ? vec3(0, 0, 1)
+            : vec3(1, 0, 0);
+
+        x = vecSub(
+          candidate,
+          vecScale(y, vecDot(candidate, y))
+        );
+      }
+
+      x = vecNormalize(x);
+
+      if (vecLength(x) < 1e-8) {
+        return quatIdentity();
+      }
+
+      // Right-handed basis: X × Y = Z.
+      let z = vecNormalize(vecCross(x, y));
+
+      if (vecLength(z) < 1e-8) {
+        return quatIdentity();
+      }
+
+      // Re-orthogonalize X to remove numerical drift.
+      x = vecNormalize(vecCross(y, z));
+
+      return quatFromBasis(x, y, z);
+    }
+
+    function getJoint(wf, name) {
+      if (!wf || !wf.joints) return null;
+      return finiteVec3(wf.joints[name]) ? wf.joints[name] : null;
+    }
+
+    function midpoint(a, b) {
+      if (!a || !b) return null;
+      return vecScale(vecAdd(a, b), 0.5);
+    }
+
+    function vecAdd(a, b) {
+      return vec3(
+        a.x + b.x,
+        a.y + b.y,
+        a.z + b.z
+      );
+    }
+
+    function getDirection(wf, aName, bName) {
+      const a = getJoint(wf, aName);
+      const b = getJoint(wf, bName);
+
+      if (!a || !b) return null;
+
+      const d = vecSub(b, a);
+
+      if (vecLength(d) < 1e-8) {
+        return null;
+      }
+
+      return vecNormalize(d);
+    }
+
+    function getBendReference(wf, jointName, childName, fallback) {
+      const joint = getJoint(wf, jointName);
+      const child = getJoint(wf, childName);
+
+      if (!joint || !child) {
+        return fallback || null;
+      }
+
+      const incomingName = SKELETON_HIERARCHY.find(
+        j => j.name === jointName
+      )?.parent;
+
+      if (!incomingName) {
+        return fallback || null;
+      }
+
+      const parent = getJoint(wf, incomingName);
+
+      if (!parent) {
+        return fallback || null;
+      }
+
+      const incoming = vecNormalize(vecSub(joint, parent));
+      const outgoing = vecNormalize(vecSub(child, joint));
+
+      if (
+        vecLength(incoming) < 1e-8 ||
+        vecLength(outgoing) < 1e-8
+      ) {
+        return fallback || null;
+      }
+
+      const bendNormal = vecCross(incoming, outgoing);
+
+      if (vecLength(bendNormal) < 1e-8) {
+        return fallback || null;
+      }
+
+      return vecNormalize(bendNormal);
+    }
+
+
+    // ==================== World Frame Construction ====================
+
+    function buildWorldFramesFromBlazePose() {
+      const frames = recordedFrames.map(frame => {
+        const joints = {};
+
+        if (frame.skeleton3D) {
+          frame.skeleton3D.forEach(j => {
+            if (j && j.position) {
+              const p = blazeToBVH(j.position);
+
+              if (finiteVec3(p)) {
+                joints[j.name] = p;
+              }
+            }
+          });
+        }
+
+        return {
+          time: Number.isFinite(frame.time) ? frame.time : 0,
+          joints,
+          rawLandmarks2D: frame.rawLandmarks2D || null
+        };
+      });
+
+      if (!frames.length) return null;
+
+      // Find the first genuinely usable frame.
+      // The first frame must define the rest/reference configuration.
+      let referenceIndex = -1;
+
+      for (let i = 0; i < frames.length; i++) {
+        const f = frames[i];
+
+        const required = [
+          'pelvis',
+          'left_hip',
+          'right_hip',
+          'chest',
+          'left_shoulder',
+          'right_shoulder'
+        ];
+
+        if (required.every(name => finiteVec3(f.joints[name]))) {
+          referenceIndex = i;
+          break;
+        }
+      }
+
+      if (referenceIndex < 0) {
+        return null;
+      }
+
+      // Keep the original number of recorded frames.
+      // Missing landmarks are carried forward from the most recent
+      // valid observation rather than generating NaNs.
+      let previous = {};
+
+      for (let i = 0; i < frames.length; i++) {
+        const f = frames[i];
+
+        const completed = {};
+
+        for (const spec of SKELETON_HIERARCHY) {
+          const current = f.joints[spec.name];
+
+          if (finiteVec3(current)) {
+            completed[spec.name] = current;
+          } else if (finiteVec3(previous[spec.name])) {
+            completed[spec.name] = previous[spec.name];
+          } else {
+            completed[spec.name] = null;
+          }
+        }
+
+        f.joints = completed;
+
+        for (const name in completed) {
+          if (finiteVec3(completed[name])) {
+            previous[name] = completed[name];
+          }
+        }
+      }
+
+      const reference = frames[referenceIndex];
+
+      // The reference pelvis becomes the origin for animation translation.
+      const referencePelvis = getJoint(reference, 'pelvis');
+
+      // Do NOT rotate the skeleton into a canonical coordinate frame here.
+      // The BlazePose -> BVH conversion has already happened above.
+      //
+      // Instead, every frame remains in the same coordinate system and
+      // rotations are computed relative to the first valid frame.
+      frames.forEach(frame => {
+        const pelvis = getJoint(frame, 'pelvis');
+
+        frame.rootTranslation =
+          pelvis && referencePelvis
+            ? vecSub(pelvis, referencePelvis)
+            : vec3(0, 0, 0);
+      });
+
+      return {
+        frames,
+        referenceIndex
+      };
+    }
+
+
+    // ==================== Stable Joint World Frames ====================
+
+    function computeJointWorldFrames(wf) {
+      const frames = {};
+
+      const pelvis = getJoint(wf, 'pelvis');
+      const chest = getJoint(wf, 'chest');
+      const leftHip = getJoint(wf, 'left_hip');
+      const rightHip = getJoint(wf, 'right_hip');
+      const leftShoulder = getJoint(wf, 'left_shoulder');
+      const rightShoulder = getJoint(wf, 'right_shoulder');
+      const neck = getJoint(wf, 'neck');
+      const head = getJoint(wf, 'head');
+
+      // ------------------------------------------------------------
+      // Pelvis
+      // ------------------------------------------------------------
+
+      if (pelvis && chest && leftHip && rightHip) {
+        const spine = vecNormalize(vecSub(chest, pelvis));
+        const right = vecNormalize(vecSub(rightHip, leftHip));
+
+        frames.pelvis = quatFromBasis(
+          right,
+          vecNormalize(
+            vecCross(right, vecNormalize(spine))
+          ),
+          spine
+        );
+      }
+
+      // ------------------------------------------------------------
+      // Chest
+      // ------------------------------------------------------------
+
+      if (pelvis && chest && leftShoulder && rightShoulder) {
+        const spine = vecNormalize(vecSub(chest, pelvis));
+        const right = vecNormalize(
+          vecSub(rightShoulder, leftShoulder)
+        );
+
+        frames.chest = quatFromBasis(
+          right,
+          vecNormalize(
+            vecCross(right, spine)
+          ),
+          spine
+        );
+      }
+
+      const pelvisQ = frames.pelvis || quatIdentity();
+      const chestQ = frames.chest || pelvisQ;
+
+      // Stable anatomical references.
+      const pelvisRight =
+        quatRotate(pelvisQ, vec3(1,0,0));
+
+      const pelvisUp =
+        quatRotate(pelvisQ, vec3(0,0,1));
+
+      const chestRight =
+        quatRotate(chestQ, vec3(1,0,0));
+
+      const chestUp =
+        quatRotate(chestQ, vec3(0,0,1));
+
+      // ------------------------------------------------------------
+      // Hips
+      // ------------------------------------------------------------
+
+      for (const side of ['left', 'right']) {
+        const hip = getJoint(wf, `${side}_hip`);
+        const knee = getJoint(wf, `${side}_knee`);
+
+        if (!hip || !knee) continue;
+
+        const thigh = vecNormalize(vecSub(knee, hip));
+
+        const ref =
+          side === 'left'
+            ? vecScale(pelvisRight, -1)
+            : pelvisRight;
+
+        frames[`${side}_hip`] =
+          quatFromPrimaryAxis(thigh, ref);
+      }
+
+      // ------------------------------------------------------------
+      // Knees
+      // ------------------------------------------------------------
+
+      for (const side of ['left', 'right']) {
+        const hip = getJoint(wf, `${side}_hip`);
+        const knee = getJoint(wf, `${side}_knee`);
+        const ankle = getJoint(wf, `${side}_ankle`);
+
+        if (!hip || !knee || !ankle) continue;
+
+        const thigh = vecNormalize(vecSub(knee, hip));
+        const shin = vecNormalize(vecSub(ankle, knee));
+
+        let bendNormal = vecCross(thigh, shin);
+
+        if (vecLength(bendNormal) < 1e-8) {
+          bendNormal = pelvisRight;
+        }
+
+        frames[`${side}_knee`] =
+          quatFromPrimaryAxis(shin, bendNormal);
+      }
+
+      // ------------------------------------------------------------
+      // Ankles
+      // ------------------------------------------------------------
+
+      for (const side of ['left', 'right']) {
+        const ankle = getJoint(wf, `${side}_ankle`);
+        const foot = getJoint(wf, `${side}_foot`);
+        const knee = getJoint(wf, `${side}_knee`);
+
+        if (!ankle) continue;
+
+        let footDir = null;
+
+        if (foot) {
+          footDir = vecNormalize(vecSub(foot, ankle));
+        } else if (knee) {
+          footDir = vecNormalize(vecSub(ankle, knee));
+        }
+
+        if (!footDir || vecLength(footDir) < 1e-8) continue;
+
+        frames[`${side}_ankle`] =
+          quatFromPrimaryAxis(
+            footDir,
+            pelvisUp
+          );
+      }
+
+      // ------------------------------------------------------------
+      // Feet
+      // ------------------------------------------------------------
+
+      for (const side of ['left', 'right']) {
+        const ankle = getJoint(wf, `${side}_ankle`);
+        const foot = getJoint(wf, `${side}_foot`);
+
+        if (!foot) continue;
+
+        let direction = null;
+
+        if (ankle) {
+          direction = vecNormalize(vecSub(foot, ankle));
+        }
+
+        if (!direction || vecLength(direction) < 1e-8) {
+          direction = pelvisUp;
+        }
+
+        frames[`${side}_foot`] =
+          quatFromPrimaryAxis(
+            direction,
+            pelvisRight
+          );
+      }
+
+      // ------------------------------------------------------------
+      // Shoulders
+      // ------------------------------------------------------------
+
+      for (const side of ['left', 'right']) {
+        const shoulder = getJoint(wf, `${side}_shoulder`);
+        const elbow = getJoint(wf, `${side}_elbow`);
+
+        if (!shoulder || !elbow) continue;
+
+        const upperArm =
+          vecNormalize(vecSub(elbow, shoulder));
+
+        const reference =
+          side === 'left'
+            ? vecScale(chestRight, -1)
+            : chestRight;
+
+        frames[`${side}_shoulder`] =
+          quatFromPrimaryAxis(
+            upperArm,
+            reference
+          );
+      }
+
+      // ------------------------------------------------------------
+      // Elbows
+      // ------------------------------------------------------------
+
+      for (const side of ['left', 'right']) {
+        const shoulder = getJoint(wf, `${side}_shoulder`);
+        const elbow = getJoint(wf, `${side}_elbow`);
+        const wrist = getJoint(wf, `${side}_wrist`);
+
+        if (!shoulder || !elbow || !wrist) continue;
+
+        const upperArm =
+          vecNormalize(vecSub(elbow, shoulder));
+
+        const forearm =
+          vecNormalize(vecSub(wrist, elbow));
+
+        let bendNormal =
+          vecCross(upperArm, forearm);
+
+        if (vecLength(bendNormal) < 1e-8) {
+          bendNormal = chestRight;
+        }
+
+        frames[`${side}_elbow`] =
+          quatFromPrimaryAxis(
+            forearm,
+            bendNormal
+          );
+      }
+
+      // ------------------------------------------------------------
+      // Wrists
+      // ------------------------------------------------------------
+
+      for (const side of ['left', 'right']) {
+        const elbow = getJoint(wf, `${side}_elbow`);
+        const wrist = getJoint(wf, `${side}_wrist`);
+
+        if (!elbow || !wrist) continue;
+
+        const forearm =
+          vecNormalize(vecSub(wrist, elbow));
+
+        frames[`${side}_wrist`] =
+          quatFromPrimaryAxis(
+            forearm,
+            chestUp
+          );
+      }
+
+      // ------------------------------------------------------------
+      // Neck
+      // ------------------------------------------------------------
+
+      if (chest && neck) {
+        const neckDir =
+          vecNormalize(vecSub(neck, chest));
+
+        frames.neck =
+          quatFromPrimaryAxis(
+            neckDir,
+            chestRight
+          );
+      }
+
+      // ------------------------------------------------------------
+      // Head
+      // ------------------------------------------------------------
+
+      if (neck && head) {
+        const headDir =
+          vecNormalize(vecSub(head, neck));
+
+        frames.head =
+          quatFromPrimaryAxis(
+            headDir,
+            chestRight
+          );
+      }
+
+      // Stable fallbacks.
+      for (const spec of SKELETON_HIERARCHY) {
+        if (!frames[spec.name]) {
+          if (spec.parent && frames[spec.parent]) {
+            frames[spec.name] = frames[spec.parent];
+          } else {
+            frames[spec.name] = quatIdentity();
+          }
+        }
+      }
+
+      return frames;
+    }
+
+
+    // ==================== Root Orientation ====================
+
+    function computeRootRotation(wf) {
+      const frames = computeJointWorldFrames(wf);
+      return frames.pelvis || quatIdentity();
+    }
+
+
+    // ==================== Rest Offsets ====================
+
+    function buildRestOffsets(worldData) {
+      if (!worldData || !worldData.frames) return {};
+
+      const first = worldData.frames[worldData.referenceIndex];
+      if (!first) return {};
+
+      const restFrames = computeJointWorldFrames(first);
+      const offsets = {};
 
       for (let i = 1; i < SKELETON_HIERARCHY.length; i++) {
         const spec = SKELETON_HIERARCHY[i];
-        const parentPos = first.joints[spec.parent];
-        const childPos = first.joints[spec.name];
-        if (parentPos && childPos) {
-          const worldBone = vecSub(childPos, parentPos);
-          const parentInv = quatConjugate(parentWorldRot[spec.parent] || quatIdentity());
-          const localBone = quatRotate(parentInv, worldBone);
-          restOffsets[spec.name] = localBone;
 
-          // Update world rotation for this joint based on the local bone direction
-          const localRot = quatFromTwoVectors(restOffsets[spec.name], vecNormalize(worldBone));
-          parentWorldRot[spec.name] = quatMultiply(
-            parentWorldRot[spec.parent] || quatIdentity(),
-            localRot
+        const parentPos = getJoint(first, spec.parent);
+        const childPos = getJoint(first, spec.name);
+
+        if (!parentPos || !childPos) {
+          offsets[spec.name] = vec3(0, 0, 0);
+          continue;
+        }
+
+        const worldOffset = vecSub(childPos, parentPos);
+
+        const parentRestWorld =
+          restFrames[spec.parent] || quatIdentity();
+
+        const localOffset =
+          quatRotate(
+            quatInverse(parentRestWorld),
+            worldOffset
           );
+
+        if (
+          finiteVec3(localOffset) &&
+          vecLength(localOffset) > 1e-8
+        ) {
+          offsets[spec.name] = localOffset;
         } else {
-          restOffsets[spec.name] = vec3(0, 0.3, 0);
-          parentWorldRot[spec.name] = parentWorldRot[spec.parent] || quatIdentity();
+          offsets[spec.name] = vec3(0, 0, 0);
         }
       }
-      return restOffsets;
+
+      return offsets;
     }
+
+
+    // ==================== Rotation Computation ====================
+
+    // Returns the LOCAL animation rotation.
+    //
+    // The BVH hierarchy's zero pose is represented by the offsets.
+    // The local quaternion here describes the actual current joint
+    // orientation relative to its parent world frame.
+    function computeJointRotation(
+      currentWorldRot,
+      parentWorldRot
+    ) {
+      if (!currentWorldRot) {
+        return quatIdentity();
+      }
+
+      const parent =
+        parentWorldRot || quatIdentity();
+
+      return quatNormalize(
+        quatMultiply(
+          quatInverse(parent),
+          currentWorldRot
+        )
+      );
+    }
+
+
+    // Exact extraction for:
+    //
+    //   R = Rz * Rx * Ry
+    //
+    // which corresponds to:
+    //
+    //   Zrotation Xrotation Yrotation
+    //
+    // used by the BVH channel order in this file.
+    function quatToBVHZXY(q) {
+      q = quatNormalize(q);
+
+      const x = q.x;
+      const y = q.y;
+      const z = q.z;
+      const w = q.w;
+
+      const x2 = x + x;
+      const y2 = y + y;
+      const z2 = z + z;
+
+      const xx = x * x2;
+      const xy = x * y2;
+      const xz = x * z2;
+
+      const yy = y * y2;
+      const yz = y * z2;
+      const zz = z * z2;
+
+      const wx = w * x2;
+      const wy = w * y2;
+      const wz = w * z2;
+
+      // Rotation matrix corresponding to the quaternion.
+      const m00 = 1 - (yy + zz);
+      const m01 = xy - wz;
+      const m02 = xz + wy;
+
+      const m10 = xy + wz;
+      const m11 = 1 - (xx + zz);
+      const m12 = yz - wx;
+
+      const m20 = xz - wy;
+      const m21 = yz + wx;
+      const m22 = 1 - (xx + yy);
+
+      // For Rz * Rx * Ry:
+      //
+      // m21 = sin(X)
+      // Z = atan2(-m01, m11)
+      //
+      // Y is extracted after removing Z.
+      const sx = Math.max(-1, Math.min(1, m21));
+      const xAngle = Math.asin(sx);
+
+      let zAngle;
+      let yAngle;
+
+      if (Math.abs(Math.cos(xAngle)) > 1e-6) {
+        zAngle = Math.atan2(-m01, m11);
+
+        const cz = Math.cos(zAngle);
+        const sz = Math.sin(zAngle);
+
+        const yNumerator =
+          m02 * cz +
+          m12 * sz;
+
+        const yDenominator =
+          m00 * cz +
+          m10 * sz;
+
+        yAngle = Math.atan2(
+          yNumerator,
+          yDenominator
+        );
+      } else {
+        // Gimbal-lock fallback.
+        zAngle = 0;
+
+        yAngle = Math.atan2(
+          m02,
+          m00
+        );
+      }
+
+      const radToDeg = 180 / Math.PI;
+
+      const result = {
+        z: zAngle * radToDeg,
+        x: xAngle * radToDeg,
+        y: yAngle * radToDeg
+      };
+
+      if (
+        !Number.isFinite(result.x) ||
+        !Number.isFinite(result.y) ||
+        !Number.isFinite(result.z)
+      ) {
+        return { z: 0, x: 0, y: 0 };
+      }
+
+      return result;
+    }
+
+
+    function computeRotationsForFrame(
+      wf,
+      previousWorldFrames
+    ) {
+      const currentFrames =
+        computeJointWorldFrames(wf);
+
+      const localRots = {};
+      const worldRots = {};
+
+      for (const spec of SKELETON_HIERARCHY) {
+        const name = spec.name;
+        const current = currentFrames[name];
+
+        let currentWorld = current || quatIdentity();
+
+        // If the current frame is valid, use it directly.
+        // Otherwise retain the previous orientation.
+        if (
+          previousWorldFrames &&
+          !current
+        ) {
+          currentWorld =
+            previousWorldFrames[name] ||
+            quatIdentity();
+        }
+
+        worldRots[name] =
+          quatNormalize(currentWorld);
+
+        if (!spec.parent) {
+          localRots[name] =
+            worldRots[name];
+        } else {
+          localRots[name] =
+            computeJointRotation(
+              worldRots[name],
+              worldRots[spec.parent]
+            );
+        }
+      }
+
+      const euler = {};
+
+      for (const spec of SKELETON_HIERARCHY) {
+        euler[spec.name] =
+          quatToBVHZXY(
+            localRots[spec.name]
+          );
+      }
+
+      return {
+        euler,
+        worldRots
+      };
+    }
+
+
+    // ==================== BVH Hierarchy ====================
 
     function buildHierarchy(restOffsets) {
       function jointToBVH(name, indent) {
-        const spec = SKELETON_HIERARCHY.find(j => j.name === name);
+        const spec =
+          SKELETON_HIERARCHY.find(
+            j => j.name === name
+          );
+
         if (!spec) return '';
+
         const lines = [];
         const pad = '  '.repeat(indent);
+
         if (spec.parent === null) {
           lines.push(`${pad}ROOT ${name}`);
           lines.push(`${pad}{`);
-          lines.push(`${pad}  OFFSET 0.0 0.0 0.0`);
-          lines.push(`${pad}  CHANNELS 6 Xposition Yposition Zposition Zrotation Xrotation Yrotation`);
+          lines.push(
+            `${pad}  OFFSET 0.000000 0.000000 0.000000`
+          );
+          lines.push(
+            `${pad}  CHANNELS 6 Xposition Yposition Zposition Zrotation Xrotation Yrotation`
+          );
         } else {
           lines.push(`${pad}JOINT ${name}`);
           lines.push(`${pad}{`);
-          const off = restOffsets[name] || vec3(0, 0, 0);
-          lines.push(`${pad}  OFFSET ${off.x.toFixed(6)} ${off.y.toFixed(6)} ${off.z.toFixed(6)}`);
-          lines.push(`${pad}  CHANNELS 3 Zrotation Xrotation Yrotation`);
-        }
-        const children = SKELETON_HIERARCHY.filter(j => j.parent === name);
-        if (children.length === 0) {
-          const endOff = vecScale(vecNormalize(restOffsets[name] || vec3(0, 1, 0)), 0.05);
-          lines.push(`${pad}  End Site`);
-          lines.push(`${pad}  {`);
-          lines.push(`${pad}    OFFSET ${endOff.x.toFixed(6)} ${endOff.y.toFixed(6)} ${endOff.z.toFixed(6)}`);
-          lines.push(`${pad}  }`);
-        } else {
-          children.forEach(ch => {
-            lines.push(jointToBVH(ch.name, indent + 1));
-          });
-        }
-        lines.push(`${pad}}`);
-        return lines.join('\n');
-      }
-      return jointToBVH('pelvis', 0);
-    }
 
-    function calculateFrameTime() {
-      const times = recordedFrames.map(f => f.time);
-      const diffs = [];
-      for (let i = 1; i < times.length; i++) {
-        diffs.push(times[i] - times[i - 1]);
-      }
-      diffs.sort((a, b) => a - b);
-      return diffs.length ? diffs[Math.floor(diffs.length / 2)] : 1 / 30;
-    }
+          const off =
+            restOffsets[name] ||
+            vec3(0, 0, 0);
 
-    function calculateRootRotation(wf) {
-      const pelvis = wf.joints['pelvis'];
-      const chest = wf.joints['chest'];
-      const lHip = wf.joints['left_hip'];
-      const rHip = wf.joints['right_hip'];
-      if (!pelvis || !chest || !lHip || !rHip) return quatIdentity();
+          lines.push(
+            `${pad}  OFFSET ` +
+            `${off.x.toFixed(6)} ` +
+            `${off.y.toFixed(6)} ` +
+            `${off.z.toFixed(6)}`
+          );
 
-      const forward = vecNormalize(vecSub(chest, pelvis));
-      const right = vecNormalize(vecSub(rHip, lHip));
-      if (vecLength(forward) < 0.01 || vecLength(right) < 0.01) return quatIdentity();
-
-      let up = vecCross(right, forward);
-      if (vecLength(up) < 0.01) return quatIdentity();
-      up = vecNormalize(up);
-      const forwardCorrected = vecNormalize(vecCross(up, right));
-
-      // No 2D yaw hack - rely on 3D basis
-      return quatFromBasis(right, up, forwardCorrected);
-    }
-
-    function calculateJointRotation(parentPos, childPos, restOffset, parentWorldRot) {
-      const parentRotInv = quatConjugate(parentWorldRot);
-      const currentBoneWorld = vecNormalize(vecSub(childPos, parentPos));
-      const restBone = vecNormalize(restOffset || vec3(0, 1, 0));
-      const currentBoneLocal = quatRotate(parentRotInv, currentBoneWorld);
-      return quatFromTwoVectors(restBone, currentBoneLocal);
-    }
-
-    function calculateRotations(worldFrames, restOffsets) {
-      // Compute rotations for each frame, then smooth Euler angles across time.
-      const rawRotations = worldFrames.map(wf => {
-        const localRots = {};
-        const parentWorldRot = { pelvis: quatIdentity() };
-        const rootQuat = calculateRootRotation(wf);
-        localRots['pelvis'] = rootQuat;
-        parentWorldRot['pelvis'] = rootQuat;
-
-        for (let i = 1; i < SKELETON_HIERARCHY.length; i++) {
-          const spec = SKELETON_HIERARCHY[i];
-          const parentPos = wf.joints[spec.parent];
-          const childPos = wf.joints[spec.name];
-          let localRot = quatIdentity();
-          if (parentPos && childPos) {
-            localRot = calculateJointRotation(
-              parentPos, childPos,
-              restOffsets[spec.name],
-              parentWorldRot[spec.parent] || quatIdentity()
-            );
-          }
-          localRots[spec.name] = localRot;
-          parentWorldRot[spec.name] = quatMultiply(
-            parentWorldRot[spec.parent] || quatIdentity(),
-            localRot
+          lines.push(
+            `${pad}  CHANNELS 3 Zrotation Xrotation Yrotation`
           );
         }
 
-        const euler = {};
-        SKELETON_HIERARCHY.forEach(j => {
-          const q = localRots[j.name] || quatIdentity();
-          euler[j.name] = quatToEulerZXY(q);
-        });
-        return euler;
-      });
+        const children =
+          SKELETON_HIERARCHY.filter(
+            j => j.parent === name
+          );
 
-      // Apply simple exponential smoothing on Euler angles
-      const smoothed = [];
-      const smoothingFactor = 0.5; // adjust as needed
-      const prevEuler = {};
-      SKELETON_HIERARCHY.forEach(j => { prevEuler[j.name] = null; });
+        if (children.length === 0) {
+          const off =
+            restOffsets[name] ||
+            vec3(0, 0, 0);
 
-      rawRotations.forEach((euler, idx) => {
-        const current = {};
-        SKELETON_HIERARCHY.forEach(j => {
-          const name = j.name;
-          if (prevEuler[name] && euler[name]) {
-            current[name] = {
-              x: prevEuler[name].x + smoothingFactor * (euler[name].x - prevEuler[name].x),
-              y: prevEuler[name].y + smoothingFactor * (euler[name].y - prevEuler[name].y),
-              z: prevEuler[name].z + smoothingFactor * (euler[name].z - prevEuler[name].z)
-            };
+          let endDirection;
+
+          if (vecLength(off) > 1e-8) {
+            endDirection =
+              vecNormalize(off);
           } else {
-            current[name] = euler[name] || { x:0, y:0, z:0 };
+            endDirection =
+              vec3(0, 0, 0.05);
           }
-          prevEuler[name] = current[name];
-        });
-        smoothed.push(current);
-      });
 
-      return smoothed;
+          const endLength =
+            Math.max(
+              vecLength(off) * 0.15,
+              0.02
+            );
+
+          const endOffset =
+            vecScale(
+              endDirection,
+              endLength
+            );
+
+          lines.push(`${pad}  End Site`);
+          lines.push(`${pad}  {`);
+          lines.push(
+            `${pad}    OFFSET ` +
+            `${endOffset.x.toFixed(6)} ` +
+            `${endOffset.y.toFixed(6)} ` +
+            `${endOffset.z.toFixed(6)}`
+          );
+          lines.push(`${pad}  }`);
+        } else {
+          children.forEach(child => {
+            lines.push(
+              jointToBVH(
+                child.name,
+                indent + 1
+              )
+            );
+          });
+        }
+
+        lines.push(`${pad}}`);
+
+        return lines.join('\n');
+      }
+
+      return jointToBVH('pelvis', 0);
     }
 
-    function buildMotionLines(worldFrames, rotationFrames) {
-      const firstPelvis = worldFrames[0].joints['pelvis'] || vec3(0, 0, 0);
-      return worldFrames.map((wf, idx) => {
-        const e = rotationFrames[idx];
-        // Use rootTranslation if available, otherwise fallback to pelvis offset
-        const rootPos = wf.rootTranslation || vec3(
-          wf.joints['pelvis'].x - firstPelvis.x,
-          wf.joints['pelvis'].y - firstPelvis.y,
-          wf.joints['pelvis'].z - firstPelvis.z
-        );
 
-        let line = `${rootPos.x.toFixed(6)} ${rootPos.y.toFixed(6)} ${rootPos.z.toFixed(6)}`;
-        line += ` ${e['pelvis'].z.toFixed(6)} ${e['pelvis'].x.toFixed(6)} ${e['pelvis'].y.toFixed(6)}`;
-        for (let i = 1; i < SKELETON_HIERARCHY.length; i++) {
-          const name = SKELETON_HIERARCHY[i].name;
-          const r = e[name];
-          line += ` ${r.z.toFixed(6)} ${r.x.toFixed(6)} ${r.y.toFixed(6)}`;
+    // ==================== Frame Timing ====================
+
+    function calculateFrameTime() {
+      const times = recordedFrames
+        .map(f => Number(f.time))
+        .filter(Number.isFinite);
+
+      const diffs = [];
+
+      for (let i = 1; i < times.length; i++) {
+        const d = times[i] - times[i - 1];
+
+        if (
+          Number.isFinite(d) &&
+          d > 0 &&
+          d < 1
+        ) {
+          diffs.push(d);
         }
+      }
+
+      if (!diffs.length) {
+        return 1 / 30;
+      }
+
+      return median(diffs);
+    }
+
+
+    // ==================== Motion Data ====================
+
+    function buildMotionLines(
+      worldData,
+      restOffsets
+    ) {
+      if (
+        !worldData ||
+        !worldData.frames ||
+        !worldData.frames.length
+      ) {
+        return [];
+      }
+
+      const frames = worldData.frames;
+
+      let previousWorldRots = null;
+
+      return frames.map(wf => {
+        const rotationData =
+          computeRotationsForFrame(
+            wf,
+            previousWorldRots
+          );
+
+        previousWorldRots =
+          rotationData.worldRots;
+
+        const e =
+          rotationData.euler;
+
+        const rootPos =
+          wf.rootTranslation ||
+          vec3(0, 0, 0);
+
+        const root =
+          e.pelvis ||
+          { z: 0, x: 0, y: 0 };
+
+        let line =
+          `${Number.isFinite(rootPos.x) ? rootPos.x : 0}` +
+          ` ${Number.isFinite(rootPos.y) ? rootPos.y : 0}` +
+          ` ${Number.isFinite(rootPos.z) ? rootPos.z : 0}`;
+
+        line +=
+          ` ${root.z.toFixed(6)}` +
+          ` ${root.x.toFixed(6)}` +
+          ` ${root.y.toFixed(6)}`;
+
+        for (
+          let i = 1;
+          i < SKELETON_HIERARCHY.length;
+          i++
+        ) {
+          const name =
+            SKELETON_HIERARCHY[i].name;
+
+          const r =
+            e[name] ||
+            { z: 0, x: 0, y: 0 };
+
+          line +=
+            ` ${Number.isFinite(r.z) ? r.z.toFixed(6) : '0.000000'}` +
+            ` ${Number.isFinite(r.x) ? r.x.toFixed(6) : '0.000000'}` +
+            ` ${Number.isFinite(r.y) ? r.y.toFixed(6) : '0.000000'}`;
+        }
+
         return line;
       });
     }
 
-    // ==================== OneEuro smoothing for world positions ====================
-    class OneEuroFilter {
-      constructor(minCutoff = 1.0, beta = 0.0, dCutoff = 1.0) {
-        this.minCutoff = minCutoff;
-        this.beta = beta;
-        this.dCutoff = dCutoff;
-        this.x = null;
-        this.dx = null;
-        this.lastT = null;
+
+    // ==================== BVH Construction ====================
+
+    function computeBVHFromWorldFrames(worldData) {
+      if (
+        !worldData ||
+        !worldData.frames ||
+        worldData.frames.length < 2
+      ) {
+        return null;
       }
-      alpha(cutoff, dt) {
-        const tau = 1 / (2 * Math.PI * cutoff);
-        return 1 / (1 + tau / dt);
+
+      const restOffsets =
+        buildRestOffsets(worldData);
+
+      const hierarchy =
+        buildHierarchy(restOffsets);
+
+      const frameTime =
+        calculateFrameTime();
+
+      const motionLines =
+        buildMotionLines(
+          worldData,
+          restOffsets
+        );
+
+      if (
+        !motionLines.length ||
+        !Number.isFinite(frameTime) ||
+        frameTime <= 0
+      ) {
+        return null;
       }
-      reset() {
-        this.x = null;
-        this.dx = null;
-        this.lastT = null;
-      }
-      filter(t, x) {
-        if (this.x == null) {
-          this.x = x;
-          this.dx = 0;
-          this.lastT = t;
-          return x;
-        }
-        const dt = t - this.lastT;
-        if (dt <= 0) {
-          this.lastT = t;
-          return this.x;
-        }
-        const dx = (x - this.x) / dt;
-        const edx = this.dx == null ? dx : this.dx;
-        const alpha = this.alpha(this.minCutoff, dt);
-        const dAlpha = this.alpha(this.dCutoff, dt);
-        const dxFilt = edx + dAlpha * (dx - edx);
-        const cutoff = this.minCutoff + this.beta * Math.abs(dxFilt);
-        const a = this.alpha(cutoff, dt);
-        this.x = this.x + a * (x - this.x);
-        this.dx = dxFilt;
-        this.lastT = t;
-        return this.x;
-      }
+
+      return (
+        `HIERARCHY\n` +
+        `${hierarchy}\n` +
+        `MOTION\n` +
+        `Frames: ${motionLines.length}\n` +
+        `Frame Time: ${frameTime.toFixed(6)}\n` +
+        `${motionLines.join('\n')}`
+      );
     }
 
-    function smoothWorldFrames(worldFrames) {
-      const filters = {};
-      SKELETON_HIERARCHY.forEach(j => {
-        filters[j.name] = {
-          x: new OneEuroFilter(0.8, 0.05, 1.0),
-          y: new OneEuroFilter(0.8, 0.05, 1.0),
-          z: new OneEuroFilter(0.8, 0.05, 1.0)
-        };
-      });
 
-      return worldFrames.map(wf => {
-        const smoothedJoints = {};
-        for (const name in wf.joints) {
-          const p = wf.joints[name];
-          if (p && filters[name]) {
-            const x = filters[name].x.filter(wf.time, p.x);
-            const y = filters[name].y.filter(wf.time, p.y);
-            const z = filters[name].z.filter(wf.time, p.z);
-            smoothedJoints[name] = vec3(x, y, z);
-          } else {
-            smoothedJoints[name] = null;
-            if (filters[name]) {
-              filters[name].x.reset();
-              filters[name].y.reset();
-              filters[name].z.reset();
-            }
-          }
-        }
-        // Smooth root translation separately
-        if (wf.rootTranslation) {
-          const rt = wf.rootTranslation;
-          // We can apply a simple moving average or just keep as is for now
-          // For simplicity, use the same filter for translation
-          if (!filters['rootTranslation']) {
-            filters['rootTranslation'] = {
-              x: new OneEuroFilter(0.8, 0.05, 1.0),
-              y: new OneEuroFilter(0.8, 0.05, 1.0),
-              z: new OneEuroFilter(0.8, 0.05, 1.0)
-            };
-          }
-          const x = filters['rootTranslation'].x.filter(wf.time, rt.x);
-          const y = filters['rootTranslation'].y.filter(wf.time, rt.y);
-          const z = filters['rootTranslation'].z.filter(wf.time, rt.z);
-          wf.rootTranslation = vec3(x, y, z);
-        }
-        return { ...wf, joints: smoothedJoints };
-      });
-    }
+    // ==================== BVH Entry Point ====================
 
-    // ==================== BVH compute wrapper ====================
-    function computeBVHFromWorldFrames(worldFrames) {
-      if (!worldFrames || worldFrames.length < 2) return null;
-      const restOffsets = calculateRestOffsets(worldFrames);
-      const hierarchyStr = buildHierarchy(restOffsets);
-      const frameTime = calculateFrameTime();
-      const rotationFrames = calculateRotations(worldFrames, restOffsets);
-      const frameLines = buildMotionLines(worldFrames, rotationFrames);
-      return `HIERARCHY\n${hierarchyStr}\nMOTION\nFrames: ${worldFrames.length}\nFrame Time: ${frameTime.toFixed(6)}\n${frameLines.join('\n')}`;
-    }
-
-    async function computeBVH() {
-      if (recordedFrames.length < 2) return null;
-
-      let worldFrames = null;
-      let pipelineLabel = '';
-
-      // Use BlazePose 3D as base for all pipelines
-      worldFrames = buildWorldFramesFromBlazePose();
-      if (!worldFrames) return null;
-
-      // If MiDaS is enabled and session available, adjust scale globally
-      if (useMiDaSCheckbox.checked && midasSession) {
-        video.pause();
-        statusEl.textContent = 'Using MiDaS for global metric scaling...';
-        statusEl.className = 'status-box';
-        try {
-          const scaleFactor = await estimateGlobalScaleFromMiDaS(recordedFrames, midasSession);
-          if (scaleFactor && Number.isFinite(scaleFactor) && scaleFactor > 0) {
-            // Apply scale factor to all joints in worldFrames
-            worldFrames.forEach(wf => {
-              for (const name in wf.joints) {
-                if (wf.joints[name]) {
-                  wf.joints[name] = vec3(
-                    wf.joints[name].x * scaleFactor,
-                    wf.joints[name].y * scaleFactor,
-                    wf.joints[name].z * scaleFactor
-                  );
-                }
-              }
-              if (wf.rootTranslation) {
-                wf.rootTranslation = vec3(
-                  wf.rootTranslation.x * scaleFactor,
-                  wf.rootTranslation.y * scaleFactor,
-                  wf.rootTranslation.z * scaleFactor
-                );
-              }
-            });
-            pipelineLabel = 'Using MiDaS metric pipeline';
-          } else {
-            pipelineLabel = 'Using BlazePose relative pipeline (MiDaS scale failed)';
-          }
-        } catch (err) {
-          console.debug('MiDaS scaling error:', err);
-          pipelineLabel = 'Using BlazePose relative pipeline (MiDaS scale failed)';
-        }
-      } else {
-        pipelineLabel = 'Using BlazePose relative pipeline';
+    function computeBVH() {
+      if (recordedFrames.length < 2) {
+        return null;
       }
 
-      // Smooth world frames after scaling
-      worldFrames = smoothWorldFrames(worldFrames);
+      const worldData =
+        buildWorldFramesFromBlazePose();
 
-      const bvh = computeBVHFromWorldFrames(worldFrames);
-      if (bvh) {
-        statusEl.textContent = `${pipelineLabel}. BVH generated (${worldFrames.length} frames).`;
-        statusEl.className = 'status-box success';
+      if (!worldData) {
+        return null;
       }
-      return bvh;
+
+      return computeBVHFromWorldFrames(
+        worldData
+      );
     }
 
-    // ==================== Export button handler ====================
-    exportBvhBtn.addEventListener('click', async () => {
-      let bvh = null;
-      try {
-        bvh = await computeBVH();
-      } catch (err) {
-        console.error('BVH generation error:', err);
-        statusEl.textContent = 'BVH generation error: ' + err.message;
-        statusEl.className = 'status-box error';
-        return;
-      }
+    // ==================== Export Button ====================
+    exportBvhBtn.addEventListener('click', () => {
+      const bvh = computeBVH();
       if (!bvh) {
         statusEl.textContent = 'BVH generation failed: not enough data.';
         statusEl.className = 'status-box error';
@@ -1846,6 +2226,17 @@
 
       statusEl.textContent = 'BVH exported successfully.';
       statusEl.className = 'status-box success';
+    });
+
+    // ==================== MiDaS Placeholder ====================
+    useMiDaSCheckbox.addEventListener('change', (ev) => {
+      if (ev.target.checked) {
+        statusEl.textContent = 'MiDaS fusion is not implemented. Using BlazePose only.';
+        statusEl.className = 'status-box';
+      } else {
+        statusEl.textContent = 'Using BlazePose only.';
+        statusEl.className = 'status-box';
+      }
     });
 
     // ==================== Boot ====================
