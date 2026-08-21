@@ -958,7 +958,7 @@
     // BlazePose: X right, Y up, Z toward camera (so forward is +Z).
     function blazeToBVH(p) {
       if (!p) return null;
-      return vec3(p.x, -p.y, p.z);
+      return vec3(-p.x, -p.y, p.z);
     }
 
     function finiteVec3(v) {
