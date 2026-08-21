@@ -1166,7 +1166,7 @@
       let previousWorldRots = null;
       let previousEuler = null;
       let previousRoot = null;
-      const SMOOTHING_FACTOR = 0.35;
+      const SMOOTHING_FACTOR = 0.75;
 
       return frames.map(wf => {
         const rotationData = computeRotationsForFrame(wf, restOffsets, previousWorldRots);
