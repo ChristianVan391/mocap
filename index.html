@@ -5,6 +5,9 @@
   No T-pose calibration. No first-frame dependence for skeleton structure.
   Per-frame joint rotations are derived from actual joint positions.
   MiDaS checkbox is a placeholder and does not affect output.
+
+  FIX: left_hip, right_hip, left_shoulder, right_shoulder now use their
+  outgoing child bone rest offset, not their own incoming offset.
 -->
 
 <!DOCTYPE html>
@@ -1167,6 +1170,15 @@
       const worldRots = {};
       const localRots = {};
 
+      // Fix: upper leg/arm bones must compare their outgoing child bone
+      // direction against the corresponding child rest offset.
+      const OUTGOING_REST = {
+        left_hip: 'left_knee',
+        right_hip: 'right_knee',
+        left_shoulder: 'left_elbow',
+        right_shoulder: 'right_elbow'
+      };
+
       for (const spec of SKELETON_HIERARCHY) {
         const name = spec.name;
         const parentName = spec.parent;
@@ -1189,7 +1201,11 @@
           const currentWorldDir = vecNormalize(vecSub(childPos, parentPos));
           if (vecLength(currentWorldDir) > 1e-8) {
             const currentLocalDir = quatRotate(quatConjugate(parentWorldRot), currentWorldDir);
-            const restDir = vecNormalize(restOffsets[name] || vec3(0,0,1));
+
+            // For the four proximal limb bones, use their child rest offset.
+            const restBoneName = OUTGOING_REST[name] || name;
+            const restDir = vecNormalize(restOffsets[restBoneName] || restOffsets[name] || vec3(0,0,1));
+
             localRot = quatFromTwoVectors(restDir, currentLocalDir);
             worldRot = quatMultiply(parentWorldRot, localRot);
           }
@@ -1279,12 +1295,10 @@
         head: vec3(0, 0, 1),
       };
 
-      // Normalize each direction.
       for (const name in directions) {
         directions[name] = vecNormalize(directions[name]);
       }
 
-      // Collect median bone length for each joint.
       for (const spec of SKELETON_HIERARCHY) {
         if (!spec.parent) continue;
         const lengths = [];
@@ -1302,7 +1316,6 @@
           const dir = directions[spec.name] || vec3(0,0,1);
           restOffsets[spec.name] = vecScale(dir, medianLen);
         } else {
-          // Fallback: use zero offset (will not affect rotation).
           restOffsets[spec.name] = vec3(0,0,0);
         }
       }
