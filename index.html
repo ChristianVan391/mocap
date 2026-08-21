@@ -351,7 +351,7 @@
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose"></script>
   
   <!-- ONNX Runtime Web (runtime JS) - use local copy /libs/ort.min.js if you added it to the repo -->
-  <script src="/libs/ort.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
   <!-- fallback to CDN if you prefer:
   <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
   -->
@@ -1933,13 +1933,6 @@
       }
       return bvh;
     }
-
-    // ==================== Event listeners for added controls ====================
-    useMiDaSCheckbox.addEventListener('change', () => {
-      if (useMiDaSCheckbox.checked && !midasSession) {
-        loadMiDaSModel();
-      }
-    });
 
     // ==================== Export button handler (async) ====================
     exportBvhBtn.addEventListener('click', async () => {
