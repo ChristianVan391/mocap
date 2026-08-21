@@ -1,0 +1,1926 @@
+<!--
+  BACKUP NOTE
+  Timestamp: 2026-08-21T00:00:00Z
+  Original single-file app backup: recommended to save the previous version as
+  mocap_bvh_original.bak or retain in version control before applying this patch.
+
+  README — Optional in-browser MiDaS metric-depth pipeline
+  --------------------------------------------------------
+  1. Set MIDAS_ONNX_URL below to a CORS-enabled hosted ONNX MiDaS model URL.
+     - The URL must allow browser CORS requests.
+     - Many MiDaS ONNX models expect square input. The default MIDAS_MODEL_SIZE is 256.
+     - To change inference resolution, edit MIDAS_MODEL_SIZE (256/384/512).
+  2. Open this HTML in a local web server (file:// may block CDN resources).
+  3. Load an MP4 and process it as usual. Original behavior is unchanged without MiDaS.
+  4. Optional metric pipeline:
+     - Check "Use MiDaS depth (ONNX) for metric scaling" (this triggers model loading).
+     - Ensure the camera horizontal FOV (deg) is correct.
+     - Click "Start Processing" then "Export BVH".
+     - The status box will report "Using MiDaS metric pipeline" or a fallback message.
+  5. No separate load, export/import buttons; only the toggle, FOV, and Export BVH.
+
+  TEST PLAN (3-5 steps)
+  1. Open modified HTML locally via a web server. Load an MP4. Verify preview and
+     processing still work when MiDaS is not loaded.
+  2. Configure MIDAS_ONNX_URL to a valid CORS ONNX MiDaS model.
+  3. Check "Use MiDaS depth", run processing, then click Export BVH. Confirm status
+     shows "Using MiDaS metric pipeline" and a BVH file downloads.
+  4. Uncheck "Use MiDaS depth", process the same video, click Export BVH. Confirm
+     BVH export still works via the fallback relative BlazePose pipeline.
+  5. Verify no extra UI controls are present (only toggle, FOV, Export BVH).
+
+  Assumptions:
+  A. recordedFrames[].rawLandmarks2D contains MediaPipe/BlazePose 33-landmark list
+     in normalized coordinates (x,y in 0..1), same as current code.
+  B. Developer hosts an ONNX MiDaS model at MIDAS_ONNX_URL with CORS enabled.
+  C. Seeking video frames via video.currentTime + seeked event is acceptable for
+     depth estimation on CPU (slow).
+-->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MoCap – Video to BVH</title>
+  <style>
+    :root {
+      --bg: #0b0d10;
+      --panel: #14171c;
+      --panel-light: #1d222a;
+      --border: #2a3038;
+      --text: #d6dbe2;
+      --text-dim: #8a929c;
+      --accent: #4a8cff;
+      --accent-hover: #3a7be0;
+      --success: #3fb96f;
+      --danger: #e05a5a;
+      --pose-color: #00e676;
+      --radius: 8px;
+      --font: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    .app-header {
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+      padding: 12px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-shrink: 0;
+    }
+    .app-title { font-size: 1.3rem; font-weight: 600; letter-spacing: 0.5px; color: #fff; }
+    .app-title span { color: var(--accent); }
+    .app-version {
+      font-size: 0.8rem;
+      color: var(--text-dim);
+      background: var(--panel-light);
+      padding: 4px 10px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+    }
+
+    .main-container {
+      display: flex;
+      flex: 1;
+      min-height: 0;
+    }
+
+    .video-panel {
+      flex: 3;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      min-width: 0;
+    }
+    .video-wrapper {
+      position: relative;
+      flex: 1;
+      background: #000;
+      border-radius: var(--radius);
+      overflow: hidden;
+      border: 1px solid var(--border);
+      box-shadow: 0 4px 24px rgba(0,0,0,0.5);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    #videoFit { position: absolute; width: 0; height: 0; }
+    .video-wrapper video,
+    .video-wrapper canvas {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+      object-fit: fill;
+    }
+    .video-wrapper canvas { z-index: 2; pointer-events: none; }
+
+    .control-panel {
+      flex: 1;
+      min-width: 300px;
+      max-width: 380px;
+      background: var(--panel);
+      border-left: 1px solid var(--border);
+      padding: 20px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 24px;
+      overflow-y: auto;
+    }
+
+    .section { display: flex; flex-direction: column; gap: 10px; }
+    .section-title {
+      font-size: 0.85rem;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: var(--text-dim);
+      font-weight: 600;
+    }
+
+    .file-drop-zone {
+      border: 2px dashed var(--border);
+      border-radius: var(--radius);
+      padding: 18px 12px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color 0.2s, background 0.2s;
+      background: var(--panel-light);
+      color: var(--text-dim);
+      font-size: 0.9rem;
+    }
+    .file-drop-zone:hover, .file-drop-zone.drag-over {
+      border-color: var(--accent);
+      color: var(--text);
+      background: #1a2030;
+    }
+    .file-drop-zone input { display: none; }
+
+    .btn {
+      background: var(--panel-light);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 10px 16px;
+      border-radius: var(--radius);
+      cursor: pointer;
+      font-size: 0.95rem;
+      font-weight: 500;
+      transition: background 0.2s, border-color 0.2s, transform 0.05s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      width: 100%;
+    }
+    .btn:hover:not(:disabled) { background: #232a33; border-color: #3a4450; }
+    .btn:active:not(:disabled) { transform: scale(0.98); }
+    .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+    .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .btn.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+
+    .preview-buttons { display: flex; gap: 10px; }
+    .preview-buttons .btn { flex: 1; }
+    .preview-time { font-size: 0.9rem; color: var(--text-dim); text-align: center; }
+
+    .progress-container { width: 100%; height: 6px; background: #222831; border-radius: 3px; overflow: hidden; }
+    .progress-bar { height: 100%; width: 0%; background: var(--accent); border-radius: 3px; transition: width 0.1s linear; }
+
+    .status-box {
+      background: var(--panel-light);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 10px 12px;
+      font-size: 0.85rem;
+      line-height: 1.5;
+      color: var(--text-dim);
+      min-height: 44px;
+      word-break: break-word;
+    }
+    .status-box.error { border-color: var(--danger); color: var(--danger); }
+    .status-box.success { border-color: var(--success); color: var(--success); }
+
+    .info-row { display: flex; justify-content: space-between; font-size: 0.9rem; color: var(--text-dim); }
+    .info-row span:last-child { color: var(--text); font-weight: 500; }
+
+    /* ADDED: MiDaS metric controls */
+    .control-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      font-size: 0.85rem;
+      color: var(--text-dim);
+    }
+    .control-row label { flex: 0 0 auto; }
+    .control-row input[type="number"] {
+      background: var(--panel-light);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: var(--radius);
+      padding: 6px 8px;
+      font-size: 0.85rem;
+      width: 90px;
+    }
+    .checkbox-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.9rem;
+      color: var(--text);
+      cursor: pointer;
+    }
+    .checkbox-row input { width: auto; }
+
+    @media (max-width: 800px) {
+      .main-container { flex-direction: column; }
+      .control-panel {
+        max-width: none;
+        border-left: none;
+        border-top: 1px solid var(--border);
+        flex-direction: row;
+        flex-wrap: wrap;
+        gap: 12px;
+        padding: 12px;
+      }
+      .section { flex: 1 1 45%; min-width: 200px; }
+      .btn { width: auto; }
+    }
+  </style>
+</head>
+<body>
+
+  <header class="app-header">
+    <div class="app-title">Mo<span>Cap</span></div>
+    <div class="app-version">BVH Export</div>
+  </header>
+
+  <div class="main-container">
+
+    <div class="video-panel">
+      <div class="video-wrapper" id="videoWrapper">
+        <div id="videoFit">
+          <video id="video" muted playsinline></video>
+          <canvas id="canvas"></canvas>
+        </div>
+      </div>
+    </div>
+
+    <div class="control-panel">
+
+      <div class="section">
+        <div class="section-title">Input Video</div>
+        <div class="file-drop-zone" id="fileDropZone">
+          Click or drop an MP4 here
+          <input type="file" id="videoInput" accept="video/*" />
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">Preview</div>
+        <div class="preview-buttons">
+          <button id="previewPlayBtn" class="btn" disabled>Play</button>
+          <button id="previewStopBtn" class="btn" disabled>Stop</button>
+        </div>
+        <div class="preview-time" id="previewTime">0:00 / 0:00</div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">Processing</div>
+        <button id="startBtn" class="btn primary" disabled>
+          Start Processing
+        </button>
+        <button id="exportBvhBtn" class="btn" disabled title="Export BVH">
+          Export BVH
+        </button>
+      </div>
+
+      <!-- ADDED: MiDaS metric depth controls (simplified) -->
+      <div class="section">
+        <div class="section-title">Metric Depth (MiDaS)</div>
+        <div class="control-row">
+          <label for="cameraFovInput">Camera horiz. FOV (deg)</label>
+          <input type="number" id="cameraFovInput" value="60" step="1" min="10" max="160" />
+        </div>
+        <label class="checkbox-row">
+          <input type="checkbox" id="useMiDaSCheckbox" />
+          Use MiDaS depth (ONNX) for metric scaling
+        </label>
+      </div>
+
+      <div class="section">
+        <div class="section-title">Progress</div>
+        <div class="progress-container">
+          <div class="progress-bar" id="progressBar"></div>
+        </div>
+        <div class="info-row">
+          <span>Frames recorded</span>
+          <span id="frameCount">0</span>
+        </div>
+        <div class="info-row">
+          <span>Video time</span>
+          <span id="videoTime">0.000s</span>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">Status</div>
+        <div class="status-box" id="status">
+          Loading model...
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-converter"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose"></script>
+  <!-- ADDED: MiDaS ONNX Runtime Web -->
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+
+  <script>
+    // ==================== DOM Elements ====================
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const statusEl = document.getElementById('status');
+    const progressBar = document.getElementById('progressBar');
+    const videoInput = document.getElementById('videoInput');
+    const startBtn = document.getElementById('startBtn');
+    const exportBvhBtn = document.getElementById('exportBvhBtn');
+    const frameCountEl = document.getElementById('frameCount');
+    const videoTimeEl = document.getElementById('videoTime');
+    const fileDropZone = document.getElementById('fileDropZone');
+    const videoWrapper = document.getElementById('videoWrapper');
+    const videoFit = document.getElementById('videoFit');
+    const previewPlayBtn = document.getElementById('previewPlayBtn');
+    const previewStopBtn = document.getElementById('previewStopBtn');
+    const previewTime = document.getElementById('previewTime');
+
+    // ADDED: MiDaS DOM elements
+    const cameraFovInput = document.getElementById('cameraFovInput');
+    const useMiDaSCheckbox = document.getElementById('useMiDaSCheckbox');
+
+    // ==================== State ====================
+    let poseDetector;
+    let processing = false;
+    let isPreviewing = false;
+    let recordedFrames = [];
+    let previewFrameCallbackId = null;
+    let prevCleanedPose2D = null;   // array of 33 {x,y,confidence} or null
+    let prevCleanedPose3D = null;   // array of 33 {x,y,z,confidence} or null
+    let stallTimeout = null;
+
+    // ADDED: MiDaS state
+    let midasSession = null;
+    const MIDAS_ONNX_URL = '<PLACEHOLDER_MIDAS_ONNX_URL>'; // developer must set hosted ONNX URL
+    const MIDAS_MODEL_SIZE = 256;   // configurable; common choices: 256, 384, 512
+    const MIDAS_DEPTH_SUBSET = 30;  // number of frames used to robustly estimate global scale
+
+    // Skeleton hierarchy (with feet)
+    const SKELETON_HIERARCHY = [
+      { name: 'pelvis', parent: null, sources: [23, 24], type: 'midpoint' },
+      { name: 'left_hip', parent: 'pelvis', sources: [23], type: 'landmark' },
+      { name: 'left_knee', parent: 'left_hip', sources: [25], type: 'landmark' },
+      { name: 'left_ankle', parent: 'left_knee', sources: [27], type: 'landmark' },
+      { name: 'left_foot', parent: 'left_ankle', sources: [31], type: 'landmark' },
+      { name: 'right_hip', parent: 'pelvis', sources: [24], type: 'landmark' },
+      { name: 'right_knee', parent: 'right_hip', sources: [26], type: 'landmark' },
+      { name: 'right_ankle', parent: 'right_knee', sources: [28], type: 'landmark' },
+      { name: 'right_foot', parent: 'right_ankle', sources: [32], type: 'landmark' },
+      { name: 'chest', parent: 'pelvis', sources: [11, 12], type: 'midpoint' },
+      { name: 'left_shoulder', parent: 'chest', sources: [11], type: 'landmark' },
+      { name: 'left_elbow', parent: 'left_shoulder', sources: [13], type: 'landmark' },
+      { name: 'left_wrist', parent: 'left_elbow', sources: [15], type: 'landmark' },
+      { name: 'right_shoulder', parent: 'chest', sources: [12], type: 'landmark' },
+      { name: 'right_elbow', parent: 'right_shoulder', sources: [14], type: 'landmark' },
+      { name: 'right_wrist', parent: 'right_elbow', sources: [16], type: 'landmark' },
+      { name: 'neck', parent: 'chest', sources: ['chest', 'head'], type: 'derived' },
+      { name: 'head', parent: 'neck', sources: [0], type: 'landmark' },
+    ];
+
+    // Confidence thresholds
+    const HIGH_CONFIDENCE = 0.5;
+    const LOW_CONFIDENCE = 0.2;
+    const GLOBAL_AVERAGE_CONFIDENCE_THRESHOLD = 0.3;
+    const MIN_RELIABLE_LANDMARKS = 10;
+
+    // ==================== Video Fit Resizing ====================
+    function resizeVideo() {
+      if (!video.videoWidth || !video.videoHeight) return;
+      const wrapperRect = videoWrapper.getBoundingClientRect();
+      const wrapperWidth = wrapperRect.width;
+      const wrapperHeight = wrapperRect.height;
+      const videoAspect = video.videoWidth / video.videoHeight;
+      const wrapperAspect = wrapperWidth / wrapperHeight;
+      let fitWidth, fitHeight;
+      if (videoAspect > wrapperAspect) {
+        fitWidth = wrapperWidth;
+        fitHeight = wrapperWidth / videoAspect;
+      } else {
+        fitHeight = wrapperHeight;
+        fitWidth = wrapperHeight * videoAspect;
+      }
+      videoFit.style.width = fitWidth + 'px';
+      videoFit.style.height = fitHeight + 'px';
+      videoFit.style.left = (wrapperWidth - fitWidth) / 2 + 'px';
+      videoFit.style.top = (wrapperHeight - fitHeight) / 2 + 'px';
+      if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+      }
+    }
+    window.addEventListener('resize', resizeVideo);
+
+    // ==================== Time formatting ====================
+    function formatTime(seconds) {
+      const m = Math.floor(seconds / 60);
+      const s = Math.floor(seconds % 60);
+      return `${m}:${s.toString().padStart(2, '0')}`;
+    }
+    function updatePreviewTime() {
+      if (video.duration) {
+        previewTime.textContent = `${formatTime(video.currentTime)} / ${formatTime(video.duration)}`;
+      }
+    }
+
+    // ==================== File Drop Zone ====================
+    fileDropZone.addEventListener('click', () => videoInput.click());
+    fileDropZone.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      fileDropZone.classList.add('drag-over');
+    });
+    fileDropZone.addEventListener('dragleave', () => {
+      fileDropZone.classList.remove('drag-over');
+    });
+    fileDropZone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      fileDropZone.classList.remove('drag-over');
+      const file = e.dataTransfer.files[0];
+      if (file) loadVideoFile(file);
+    });
+    videoInput.addEventListener('change', (e) => {
+      const file = e.target.files[0];
+      if (file) loadVideoFile(file);
+    });
+
+    function loadVideoFile(file) {
+      stopPreview();
+      processing = false;
+      recordedFrames = [];
+      exportBvhBtn.disabled = true;
+      startBtn.disabled = true;
+      progressBar.style.width = '0%';
+      frameCountEl.textContent = '0';
+      videoTimeEl.textContent = '0.000s';
+      statusEl.className = 'status-box';
+      statusEl.textContent = 'Loading video metadata...';
+      previewPlayBtn.disabled = true;
+      previewStopBtn.disabled = true;
+      previewTime.textContent = '0:00 / 0:00';
+      prevCleanedPose2D = null;
+      prevCleanedPose3D = null;
+      if (stallTimeout) clearTimeout(stallTimeout);
+
+      if (video.src) URL.revokeObjectURL(video.src);
+      video.src = URL.createObjectURL(file);
+      video.load();
+    }
+
+    // ==================== Video Events ====================
+    video.addEventListener('loadedmetadata', () => {
+      startBtn.disabled = false;
+      previewPlayBtn.disabled = false;
+      previewStopBtn.disabled = false;
+      statusEl.textContent = `Loaded ${video.videoWidth}×${video.videoHeight}, duration ${video.duration.toFixed(2)}s. Use Preview or Start Processing.`;
+      resizeVideo();
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      updatePreviewTime();
+    });
+    video.addEventListener('play', () => { previewPlayBtn.textContent = 'Pause'; });
+    video.addEventListener('pause', () => { previewPlayBtn.textContent = 'Play'; });
+    video.addEventListener('timeupdate', updatePreviewTime);
+    video.addEventListener('ended', () => {
+      if (isPreviewing) stopPreview();
+      if (processing) finalizeProcessing();
+      updatePreviewTime();
+    });
+
+    // ==================== Preview Controls ====================
+    previewPlayBtn.addEventListener('click', () => {
+      if (processing) return;
+      if (isPreviewing) {
+        video.pause();
+        stopPreview();
+      } else {
+        startPreview();
+      }
+    });
+    previewStopBtn.addEventListener('click', () => {
+      if (processing) return;
+      stopPreview();
+      video.pause();
+      video.currentTime = 0;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (video.readyState >= 2) ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      updatePreviewTime();
+      prevCleanedPose2D = null;
+      prevCleanedPose3D = null;
+    });
+
+    async function startPreview() {
+      if (!poseDetector) {
+        statusEl.textContent = 'Model not ready yet.';
+        statusEl.className = 'status-box error';
+        return;
+      }
+      if (!video.src || video.readyState < 2) {
+        statusEl.textContent = 'No video loaded.';
+        statusEl.className = 'status-box error';
+        return;
+      }
+
+      prevCleanedPose2D = null;
+      prevCleanedPose3D = null;
+      isPreviewing = true;
+      previewPlayBtn.textContent = 'Pause';
+      statusEl.textContent = 'Preview mode: skeleton tracking running...';
+      statusEl.className = 'status-box';
+
+      try {
+        await video.play();
+        previewFrameCallbackId = video.requestVideoFrameCallback(previewLoop);
+      } catch (err) {
+        isPreviewing = false;
+        previewPlayBtn.textContent = 'Play';
+        statusEl.textContent = 'Error playing video: ' + err.message;
+        statusEl.className = 'status-box error';
+      }
+    }
+
+    function stopPreview() {
+      isPreviewing = false;
+      previewPlayBtn.textContent = 'Play';
+      if (previewFrameCallbackId !== null) {
+        video.cancelVideoFrameCallback(previewFrameCallbackId);
+        previewFrameCallbackId = null;
+      }
+    }
+
+    // ==================== Cleaning Pipelines ====================
+    function cleanPose2D(rawKeypoints) {
+      if (!rawKeypoints || rawKeypoints.length === 0) {
+        return { landmarks: prevCleanedPose2D, valid: false };
+      }
+      let sumScore = 0, reliableCount = 0;
+      rawKeypoints.forEach(kp => {
+        const score = kp.score ?? 0;
+        sumScore += score;
+        if (score >= LOW_CONFIDENCE) reliableCount++;
+      });
+      const avgScore = sumScore / rawKeypoints.length;
+      if (reliableCount < MIN_RELIABLE_LANDMARKS || avgScore < GLOBAL_AVERAGE_CONFIDENCE_THRESHOLD) {
+        return { landmarks: prevCleanedPose2D, valid: false };
+      }
+      if (!prevCleanedPose2D) {
+        prevCleanedPose2D = rawKeypoints.map(kp => ({
+          x: kp.x,
+          y: kp.y,
+          confidence: kp.score ?? 0
+        }));
+        return { landmarks: prevCleanedPose2D, valid: true };
+      }
+      const cleaned = rawKeypoints.map((kp, i) => {
+        const prev = prevCleanedPose2D[i];
+        if (!prev) return { x: kp.x, y: kp.y, confidence: kp.score ?? 0 };
+        const score = kp.score ?? 0;
+        let currWeight, prevWeight;
+        if (score >= HIGH_CONFIDENCE) { currWeight = 0.6; prevWeight = 0.4; }
+        else if (score >= LOW_CONFIDENCE) { currWeight = 0.4; prevWeight = 0.6; }
+        else { currWeight = 0.2; prevWeight = 0.8; }
+        return {
+          x: prev.x * prevWeight + kp.x * currWeight,
+          y: prev.y * prevWeight + kp.y * currWeight,
+          confidence: score
+        };
+      });
+      prevCleanedPose2D = cleaned;
+      return { landmarks: cleaned, valid: true };
+    }
+
+    function cleanPose3D(rawKeypoints3D) {
+      if (!rawKeypoints3D || rawKeypoints3D.length === 0) {
+        return { landmarks: prevCleanedPose3D, valid: false };
+      }
+      let sumScore = 0, reliableCount = 0;
+      rawKeypoints3D.forEach(kp => {
+        const score = kp.score ?? 0;
+        sumScore += score;
+        if (score >= LOW_CONFIDENCE) reliableCount++;
+      });
+      const avgScore = sumScore / rawKeypoints3D.length;
+      if (reliableCount < MIN_RELIABLE_LANDMARKS || avgScore < GLOBAL_AVERAGE_CONFIDENCE_THRESHOLD) {
+        return { landmarks: prevCleanedPose3D, valid: false };
+      }
+      if (!prevCleanedPose3D) {
+        prevCleanedPose3D = rawKeypoints3D.map(kp => ({
+          x: kp.x,
+          y: kp.y,
+          z: kp.z,
+          confidence: kp.score ?? 0
+        }));
+        return { landmarks: prevCleanedPose3D, valid: true };
+      }
+      const cleaned = rawKeypoints3D.map((kp, i) => {
+        const prev = prevCleanedPose3D[i];
+        if (!prev) return { x: kp.x, y: kp.y, z: kp.z, confidence: kp.score ?? 0 };
+        const score = kp.score ?? 0;
+        let currWeight, prevWeight;
+        if (score >= HIGH_CONFIDENCE) { currWeight = 0.6; prevWeight = 0.4; }
+        else if (score >= LOW_CONFIDENCE) { currWeight = 0.4; prevWeight = 0.6; }
+        else { currWeight = 0.2; prevWeight = 0.8; }
+        return {
+          x: prev.x * prevWeight + kp.x * currWeight,
+          y: prev.y * prevWeight + kp.y * currWeight,
+          z: prev.z * prevWeight + kp.z * currWeight,
+          confidence: score
+        };
+      });
+      prevCleanedPose3D = cleaned;
+      return { landmarks: cleaned, valid: true };
+    }
+
+    // ==================== Skeleton Computation (2D and 3D) ====================
+    function computeSkeletonGeneric(landmarks, globalValid, is3D) {
+      if (!landmarks || landmarks.length === 0) return [];
+      const joints = [];
+      const jointByName = {};
+      const directMap = {
+        head: 0,
+        left_shoulder: 11, left_elbow: 13, left_wrist: 15,
+        right_shoulder: 12, right_elbow: 14, right_wrist: 16,
+        left_hip: 23, left_knee: 25, left_ankle: 27, left_foot: 31,
+        right_hip: 24, right_knee: 26, right_ankle: 28, right_foot: 32
+      };
+
+      for (const name of Object.keys(directMap)) {
+        const idx = directMap[name];
+        const lm = landmarks[idx];
+        if (!lm || lm.confidence < LOW_CONFIDENCE || !globalValid) {
+          joints.push({
+            name,
+            position: lm ? (is3D ? { x: lm.x, y: lm.y, z: lm.z } : { x: lm.x, y: lm.y }) : null,
+            confidence: lm ? lm.confidence : 0,
+            valid: false,
+            parent: SKELETON_HIERARCHY.find(j => j.name === name)?.parent || null
+          });
+        } else {
+          joints.push({
+            name,
+            position: is3D ? { x: lm.x, y: lm.y, z: lm.z } : { x: lm.x, y: lm.y },
+            confidence: lm.confidence,
+            valid: true,
+            parent: SKELETON_HIERARCHY.find(j => j.name === name)?.parent || null
+          });
+        }
+        jointByName[name] = joints[joints.length - 1];
+      }
+
+      const derivedOrder = ['pelvis', 'chest', 'spine', 'neck'];
+      for (const name of derivedOrder) {
+        const spec = SKELETON_HIERARCHY.find(j => j.name === name);
+        if (!spec) continue;
+        let position = null;
+        let confidence = 0;
+        let valid = true;
+
+        if (spec.type === 'midpoint') {
+          const idxs = spec.sources;
+          const pts = idxs.map(idx => landmarks[idx]).filter(p => p && p.confidence >= LOW_CONFIDENCE);
+          if (pts.length === 2 && globalValid) {
+            if (is3D) {
+              position = {
+                x: (pts[0].x + pts[1].x) / 2,
+                y: (pts[0].y + pts[1].y) / 2,
+                z: (pts[0].z + pts[1].z) / 2
+              };
+            } else {
+              position = {
+                x: (pts[0].x + pts[1].x) / 2,
+                y: (pts[0].y + pts[1].y) / 2
+              };
+            }
+            confidence = (pts[0].confidence + pts[1].confidence) / 2;
+            valid = true;
+          } else {
+            valid = false;
+            if (pts.length > 0) {
+              position = is3D ? { x: pts[0].x, y: pts[0].y, z: pts[0].z } : { x: pts[0].x, y: pts[0].y };
+              confidence = pts[0].confidence;
+            }
+          }
+        } else if (spec.type === 'derived') {
+          const srcA = jointByName[spec.sources[0]];
+          const srcB = jointByName[spec.sources[1]];
+          if (srcA && srcB && srcA.valid && srcB.valid && globalValid) {
+            if (is3D) {
+              position = {
+                x: (srcA.position.x + srcB.position.x) / 2,
+                y: (srcA.position.y + srcB.position.y) / 2,
+                z: (srcA.position.z + srcB.position.z) / 2
+              };
+            } else {
+              position = {
+                x: (srcA.position.x + srcB.position.x) / 2,
+                y: (srcA.position.y + srcB.position.y) / 2
+              };
+            }
+            confidence = (srcA.confidence + srcB.confidence) / 2;
+            valid = true;
+          } else {
+            valid = false;
+            if (srcA && srcA.position) {
+              position = is3D ? { ...srcA.position } : { ...srcA.position };
+              confidence = srcA.confidence;
+            } else if (srcB && srcB.position) {
+              position = is3D ? { ...srcB.position } : { ...srcB.position };
+              confidence = srcB.confidence;
+            }
+          }
+        }
+
+        joints.push({ name, position, confidence, valid, parent: spec.parent });
+        jointByName[name] = joints[joints.length - 1];
+      }
+
+      return SKELETON_HIERARCHY.map(spec => joints.find(j => j.name === spec.name)).filter(Boolean);
+    }
+
+    function computeSkeleton2D(landmarks, globalValid) {
+      return computeSkeletonGeneric(landmarks, globalValid, false);
+    }
+    function computeSkeleton3D(landmarks, globalValid) {
+      return computeSkeletonGeneric(landmarks, globalValid, true);
+    }
+
+    // ==================== Preview Loop ====================
+    function previewLoop(now, metadata) {
+      if (!isPreviewing || video.paused || video.ended) {
+        stopPreview();
+        return;
+      }
+
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const frameTime = metadata && metadata.mediaTime !== undefined ? metadata.mediaTime : video.currentTime;
+
+      poseDetector.estimatePoses(video, { flipHorizontal: false })
+        .then((poses) => {
+          if (!isPreviewing) return;
+
+          let rawKeypoints = null;
+          if (poses && poses.length > 0) {
+            rawKeypoints = poses[0].keypoints;
+          }
+          const cleanResult2D = cleanPose2D(rawKeypoints);
+          const skeleton2D = computeSkeleton2D(cleanResult2D.landmarks, cleanResult2D.valid);
+          drawSkeletonPreview(skeleton2D, cleanResult2D.valid);
+
+          if (isPreviewing && !video.paused && !video.ended) {
+            previewFrameCallbackId = video.requestVideoFrameCallback(previewLoop);
+          } else {
+            stopPreview();
+          }
+        })
+        .catch(err => {
+          console.error('Preview detection error:', err);
+          stopPreview();
+          statusEl.textContent = 'Preview detection error: ' + err.message;
+          statusEl.className = 'status-box error';
+        });
+    }
+
+    // ==================== Pose Detector Initialization ====================
+    async function initPoseDetector() {
+      try {
+        statusEl.textContent = 'Setting up TensorFlow.js backend...';
+        await tf.setBackend('webgl');
+        await tf.ready();
+        statusEl.textContent = 'Loading BlazePose model...';
+        poseDetector = await poseDetection.createDetector(
+          poseDetection.SupportedModels.BlazePose,
+          {
+            runtime: 'mediapipe',
+            solutionPath: 'https://cdn.jsdelivr.net/npm/@mediapipe/pose',
+            modelType: 'full'
+          }
+        );
+        statusEl.textContent = 'Model ready. Select a local MP4 video.';
+        statusEl.className = 'status-box success';
+      } catch (err) {
+        statusEl.textContent = 'Error loading model: ' + err.message;
+        statusEl.className = 'status-box error';
+        console.error(err);
+      }
+    }
+
+    // ==================== Processing (Recording) ====================
+    function finalizeProcessing() {
+      if (!processing) return;
+      processing = false;
+      startBtn.disabled = false;
+      exportBvhBtn.disabled = false;
+      previewPlayBtn.disabled = false;
+      previewStopBtn.disabled = false;
+      statusEl.textContent = `Done. Recorded ${recordedFrames.length} frames. Export BVH.`;
+      statusEl.className = 'status-box success';
+      updatePreviewTime();
+      if (stallTimeout) {
+        clearTimeout(stallTimeout);
+        stallTimeout = null;
+      }
+    }
+
+    startBtn.addEventListener('click', async () => {
+      if (!poseDetector || !video.src || video.readyState < 2) {
+        statusEl.textContent = 'Please select a video first.';
+        statusEl.className = 'status-box error';
+        return;
+      }
+      if (processing) return;
+
+      stopPreview();
+      prevCleanedPose2D = null;
+      prevCleanedPose3D = null;
+
+      processing = true;
+      recordedFrames = [];
+      exportBvhBtn.disabled = true;
+      startBtn.disabled = true;
+      previewPlayBtn.disabled = true;
+      previewStopBtn.disabled = true;
+
+      progressBar.style.width = '0%';
+      frameCountEl.textContent = '0';
+      videoTimeEl.textContent = '0.000s';
+      statusEl.className = 'status-box';
+      statusEl.textContent = 'Processing frames and building skeleton...';
+
+      video.currentTime = 0;
+      try {
+        await video.play();
+      } catch (e) {
+        statusEl.textContent = 'Error playing video: ' + e.message;
+        statusEl.className = 'status-box error';
+        processing = false;
+        startBtn.disabled = false;
+        previewPlayBtn.disabled = false;
+        previewStopBtn.disabled = false;
+        return;
+      }
+
+      video.requestVideoFrameCallback(processVideoFrame);
+
+      const startStallTimer = () => {
+        if (stallTimeout) clearTimeout(stallTimeout);
+        stallTimeout = setTimeout(() => {
+          if (processing) finalizeProcessing();
+        }, 5000);
+      };
+      startStallTimer();
+      window.resetStallTimer = startStallTimer;
+    });
+
+    function processVideoFrame(now, metadata) {
+      if (!processing) return;
+
+      if (window.resetStallTimer) window.resetStallTimer();
+
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const timeSec = metadata && metadata.mediaTime !== undefined ? metadata.mediaTime : video.currentTime;
+
+      poseDetector.estimatePoses(video, { flipHorizontal: false })
+        .then((poses) => {
+          if (!processing) return;
+
+          let raw2D = null, raw3D = null;
+          if (poses && poses.length > 0) {
+            raw2D = poses[0].keypoints;
+            raw3D = poses[0].keypoints3D || null;
+          }
+
+          const cleanResult2D = cleanPose2D(raw2D);
+          const cleanResult3D = cleanPose3D(raw3D);
+          const skeleton2D = computeSkeleton2D(cleanResult2D.landmarks, cleanResult2D.valid);
+          const skeleton3D = computeSkeleton3D(cleanResult3D.landmarks, cleanResult3D.valid);
+
+          const frameData = {
+            time: timeSec,
+            skeleton2D: skeleton2D,
+            skeleton3D: skeleton3D,
+            rawLandmarks2D: raw2D ? raw2D.map(kp => ({ x: kp.x, y: kp.y, score: kp.score ?? 0 })) : null,
+            rawLandmarks3D: raw3D ? raw3D.map(kp => ({ x: kp.x, y: kp.y, z: kp.z, score: kp.score ?? 0 })) : null
+          };
+          recordedFrames.push(frameData);
+
+          drawSkeletonPreview(skeleton2D, cleanResult2D.valid);
+
+          const progress = video.duration > 0
+            ? (video.currentTime / video.duration) * 100
+            : 0;
+          progressBar.style.width = progress.toFixed(1) + '%';
+          frameCountEl.textContent = recordedFrames.length;
+          videoTimeEl.textContent = timeSec.toFixed(3) + 's';
+          statusEl.textContent = `Frame ${recordedFrames.length} | t=${timeSec.toFixed(3)}s | ${progress.toFixed(1)}%`;
+
+          const epsilon = 0.05;
+          if (video.ended || video.currentTime >= video.duration - epsilon) {
+            finalizeProcessing();
+            return;
+          }
+
+          if (!video.paused && !video.ended) {
+            video.requestVideoFrameCallback(processVideoFrame);
+          } else {
+            finalizeProcessing();
+          }
+        })
+        .catch(err => {
+          console.error('Detection error:', err);
+          finalizeProcessing();
+          statusEl.textContent = 'Detection error: ' + err.message;
+          statusEl.className = 'status-box error';
+        });
+    }
+
+    // ==================== Skeleton Preview Drawing (2D) ====================
+    function drawSkeletonPreview(skeleton, frameValid) {
+      if (video.readyState >= 2) {
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      }
+
+      if (!skeleton || skeleton.length === 0) return;
+
+      skeleton.forEach(joint => {
+        if (!joint.parent) return;
+        const parentJoint = skeleton.find(j => j.name === joint.parent);
+        if (!parentJoint || !joint.position || !parentJoint.position) return;
+        if (!joint.valid || !parentJoint.valid) return;
+
+        const conf = Math.min(joint.confidence, parentJoint.confidence);
+        let strokeColor = '#00e676';
+        if (conf < LOW_CONFIDENCE) strokeColor = '#ff4444';
+        else if (conf < HIGH_CONFIDENCE) strokeColor = '#ffaa00';
+
+        ctx.strokeStyle = strokeColor;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(parentJoint.position.x, parentJoint.position.y);
+        ctx.lineTo(joint.position.x, joint.position.y);
+        ctx.stroke();
+      });
+
+      skeleton.forEach(joint => {
+        if (!joint.position) return;
+
+        let fillColor, radius = 5;
+        if (!joint.valid) {
+          fillColor = '#ff8800';
+        } else {
+          const conf = joint.confidence;
+          if (conf < LOW_CONFIDENCE) fillColor = '#ff4444';
+          else if (conf < HIGH_CONFIDENCE) fillColor = '#ffaa00';
+          else fillColor = '#00e676';
+        }
+
+        ctx.fillStyle = fillColor;
+        ctx.beginPath();
+        ctx.arc(joint.position.x, joint.position.y, radius, 0, 2 * Math.PI);
+        ctx.fill();
+      });
+    }
+
+    // ==================== BVH Export (Uses 3D keypoints with proper conversion) ====================
+    const TARGET_HEIGHT = 1.7;
+
+    function vec3(x,y,z) { return {x,y,z}; }
+    function vecSub(a,b) { return vec3(a.x-b.x, a.y-b.y, a.z-b.z); }
+    function vecScale(a,s) { return vec3(a.x*s, a.y*s, a.z*s); }
+    function vecLength(a) { return Math.sqrt(a.x*a.x + a.y*a.y + a.z*a.z); }
+    function vecNormalize(a) { const l = vecLength(a); if (l < 1e-10) return vec3(0,0,0); return vecScale(a, 1/l); }
+    function vecDot(a,b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
+    function vecCross(a,b) { return vec3(a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x); }
+
+    function quatIdentity() { return {w:1, x:0, y:0, z:0}; }
+    function quatMultiply(q1,q2) {
+      return {
+        w: q1.w*q2.w - q1.x*q2.x - q1.y*q2.y - q1.z*q2.z,
+        x: q1.w*q2.x + q1.x*q2.w + q1.y*q2.z - q1.z*q2.y,
+        y: q1.w*q2.y - q1.x*q2.z + q1.y*q2.w + q1.z*q2.x,
+        z: q1.w*q2.z + q1.x*q2.y - q1.y*q2.x + q1.z*q2.w
+      };
+    }
+    function quatConjugate(q) { return {w:q.w, x:-q.x, y:-q.y, z:-q.z}; }
+    function quatRotate(q, v) {
+      const qv = {w:0, x:v.x, y:v.y, z:v.z};
+      const qvRot = quatMultiply(quatMultiply(q, qv), quatConjugate(q));
+      return vec3(qvRot.x, qvRot.y, qvRot.z);
+    }
+    function quatFromTwoVectors(a, b) {
+      a = vecNormalize(a);
+      b = vecNormalize(b);
+      if (vecLength(a) < 1e-10 || vecLength(b) < 1e-10) return quatIdentity();
+      const dot = vecDot(a,b);
+      if (dot > 0.9999) return quatIdentity();
+      if (dot < -0.9999) {
+        const axis = Math.abs(a.x) < 0.9 ? vec3(1,0,0) : vec3(0,1,0);
+        const ort = vecNormalize(vecCross(a, axis));
+        return {w:0, x:ort.x, y:ort.y, z:ort.z};
+      }
+      const axis = vecCross(a,b);
+      const w = 1 + dot;
+      const q = {w, x:axis.x, y:axis.y, z:axis.z};
+      const l = Math.sqrt(q.w*q.w + q.x*q.x + q.y*q.y + q.z*q.z);
+      return {w:q.w/l, x:q.x/l, y:q.y/l, z:q.z/l};
+    }
+    function quatFromBasis(xAxis, yAxis, zAxis) {
+      // Build rotation matrix from basis vectors and convert to quaternion
+      const m00 = xAxis.x, m01 = yAxis.x, m02 = zAxis.x;
+      const m10 = xAxis.y, m11 = yAxis.y, m12 = zAxis.y;
+      const m20 = xAxis.z, m21 = yAxis.z, m22 = zAxis.z;
+      const trace = m00 + m11 + m22;
+      let q;
+      if (trace > 0) {
+        const s = Math.sqrt(trace + 1.0) * 2;
+        q = {
+          w: 0.25 * s,
+          x: (m21 - m12) / s,
+          y: (m02 - m20) / s,
+          z: (m10 - m01) / s
+        };
+      } else if (m00 > m11 && m00 > m22) {
+        const s = Math.sqrt(1.0 + m00 - m11 - m22) * 2;
+        q = {
+          w: (m21 - m12) / s,
+          x: 0.25 * s,
+          y: (m01 + m10) / s,
+          z: (m02 + m20) / s
+        };
+      } else if (m11 > m22) {
+        const s = Math.sqrt(1.0 + m11 - m00 - m22) * 2;
+        q = {
+          w: (m02 - m20) / s,
+          x: (m01 + m10) / s,
+          y: 0.25 * s,
+          z: (m12 + m21) / s
+        };
+      } else {
+        const s = Math.sqrt(1.0 + m22 - m00 - m11) * 2;
+        q = {
+          w: (m10 - m01) / s,
+          x: (m02 + m20) / s,
+          y: (m12 + m21) / s,
+          z: 0.25 * s
+        };
+      }
+      // Normalize
+      const l = Math.sqrt(q.w*q.w + q.x*q.x + q.y*q.y + q.z*q.z);
+      if (l < 1e-10) return quatIdentity();
+      return {w:q.w/l, x:q.x/l, y:q.y/l, z:q.z/l};
+    }
+    function quatToEulerZXY(q) {
+      const x=q.x, y=q.y, z=q.z, w=q.w;
+      const x2=x+x, y2=y+y, z2=z+z;
+      const xx=x*x2, xy=x*y2, xz=x*z2;
+      const yy=y*y2, yz=y*z2, zz=z*z2;
+      const wx=w*x2, wy=w*y2, wz=w*z2;
+
+      const m00 = 1 - (yy + zz);
+      const m01 = xy - wz;
+      const m02 = xz + wy;
+      const m10 = xy + wz;
+      const m11 = 1 - (xx + zz);
+      const m12 = yz - wx;
+      const m20 = xz - wy;
+      const m21 = yz + wx;
+      const m22 = 1 - (xx + yy);
+
+      let sx, sy, sz;
+      sy = Math.asin(Math.max(-1, Math.min(1, m20)));
+      if (Math.abs(m20) < 0.99999) {
+        sx = Math.atan2(-m21, m22);
+        sz = Math.atan2(-m10, m00);
+      } else {
+        sx = Math.atan2(m12, m11);
+        sz = 0;
+      }
+      const radToDeg = 180/Math.PI;
+      return { x: sx*radToDeg, y: sy*radToDeg, z: sz*radToDeg };
+    }
+
+    function median(arr) {
+      if (!arr.length) return 0;
+      const sorted = [...arr].sort((a,b)=>a-b);
+      const mid = Math.floor(sorted.length/2);
+      return sorted.length % 2 ? sorted[mid] : (sorted[mid-1]+sorted[mid])/2;
+    }
+
+    // BlazePose to BVH coordinate conversion:
+    // BlazePose: +x = right, +y = up, +z = toward camera
+    // BVH/Blender: +x = left, +y = up, +z = forward
+    function blazePoseToBVH(v) {
+      return vec3(-v.x, -v.y, v.z);
+    }
+
+    // ==================== Original buildWorldFrames (relative BlazePose fallback) ====================
+    function buildWorldFrames() {
+      const ANCHOR_FRAMES = 10;
+
+      const worldFrames = recordedFrames.map(frame => {
+        const joints = {};
+        if (frame.skeleton3D) {
+          frame.skeleton3D.forEach(j => {
+            if (j.position) {
+              joints[j.name] = blazePoseToBVH(vec3(j.position.x, j.position.y, j.position.z));
+            } else {
+              joints[j.name] = null;
+            }
+          });
+        }
+        return { time: frame.time, joints, rawLandmarks2D: frame.rawLandmarks2D };
+      });
+
+      // Scale based on 3D height (using Euclidean distance for robustness)
+      const heights = [];
+      worldFrames.forEach(wf => {
+        const head = wf.joints['head'];
+        const ankle = wf.joints['left_ankle'];
+        if (head && ankle) {
+          const h = vecLength(vecSub(head, ankle));
+          if (h > 0) heights.push(h);
+        }
+      });
+
+      if (!heights.length) return null;
+      const medianHeight = median(heights);
+      if (medianHeight < 1e-6) return null;
+      const scale3D = TARGET_HEIGHT / medianHeight;
+
+      worldFrames.forEach(wf => {
+        for (const name in wf.joints) {
+          if (wf.joints[name]) {
+            const v = wf.joints[name];
+            wf.joints[name] = vec3(v.x * scale3D, v.y * scale3D, v.z * scale3D);
+          }
+        }
+      });
+
+      // Recover global translation from 2D keypoints
+      const pelvis2DPositions = [];
+      const pixelHeights = [];
+
+      worldFrames.forEach(wf => {
+        const lm = wf.rawLandmarks2D;
+        if (!lm) {
+          pelvis2DPositions.push(null);
+          return;
+        }
+
+        // Pixel height: head (0) to ankle (27 or 28)
+        const head = lm[0];
+        let ankle = lm[27];
+        if (!ankle || ankle.score < LOW_CONFIDENCE) ankle = lm[28];
+        if (head && ankle && head.score >= LOW_CONFIDENCE && ankle.score >= LOW_CONFIDENCE) {
+          const dx = head.x - ankle.x;
+          const dy = head.y - ankle.y;
+          pixelHeights.push(Math.sqrt(dx * dx + dy * dy));
+        }
+
+        // Pelvis 2D: midpoint of hips (23, 24)
+        const lHip = lm[23];
+        const rHip = lm[24];
+        if (lHip && rHip && lHip.score >= LOW_CONFIDENCE && rHip.score >= LOW_CONFIDENCE) {
+          pelvis2DPositions.push({ x: (lHip.x + rHip.x) / 2, y: (lHip.y + rHip.y) / 2 });
+        } else {
+          pelvis2DPositions.push(null);
+        }
+      });
+
+      // Compute median pixel height for scale
+      const validPixelHeights = pixelHeights.filter(h => h > 0);
+      if (validPixelHeights.length === 0) return worldFrames; // no translation data available
+
+      const medianPixelHeight = median(validPixelHeights);
+      if (medianPixelHeight < 1e-6) return worldFrames;
+      const scale2D = TARGET_HEIGHT / medianPixelHeight;
+
+      // Find anchor pelvis position using median of first ANCHOR_FRAMES valid measurements
+      const anchorPelvisPositions = [];
+      for (let i = 0; i < pelvis2DPositions.length && anchorPelvisPositions.length < ANCHOR_FRAMES; i++) {
+        if (pelvis2DPositions[i]) {
+          anchorPelvisPositions.push(pelvis2DPositions[i]);
+        }
+      }
+
+      if (anchorPelvisPositions.length === 0) return worldFrames; // no valid pelvis at all
+
+      const anchorX = median(anchorPelvisPositions.map(p => p.x));
+      const anchorY = median(anchorPelvisPositions.map(p => p.y));
+
+      // Apply translation to every joint of every frame
+      worldFrames.forEach((wf, idx) => {
+        const pelvis2D = pelvis2DPositions[idx];
+        if (!pelvis2D) return; // skip frames with invalid pelvis
+
+        const deltaX = pelvis2D.x - anchorX;
+        const deltaY = pelvis2D.y - anchorY;
+
+        // Convert pixel displacement to world units; mapping matches blazePoseToBVH
+        const translation = {
+          x: -deltaX * scale2D,
+          y: -deltaY * scale2D,
+          z: 0
+        };
+
+        for (const name in wf.joints) {
+          if (wf.joints[name]) {
+            wf.joints[name] = vec3(
+              wf.joints[name].x + translation.x,
+              wf.joints[name].y + translation.y,
+              wf.joints[name].z + translation.z
+            );
+          }
+        }
+      });
+
+      return worldFrames;
+    }
+
+    // ==================== Existing BVH building functions ====================
+    function calculateRestOffsets(worldFrames) {
+      const restOffsets = {};
+
+      SKELETON_HIERARCHY.forEach(spec => {
+        if (!spec.parent) return;
+
+        const parentName = spec.parent;
+        const childName = spec.name;
+        const vectors = [];
+
+        worldFrames.forEach(wf => {
+          const p = wf.joints[parentName];
+          const c = wf.joints[childName];
+          if (p && c) {
+            vectors.push(vecSub(c, p));
+          }
+        });
+
+        if (vectors.length > 0) {
+          const sum = vectors.reduce((acc, v) => vec3(acc.x + v.x, acc.y + v.y, acc.z + v.z), vec3(0, 0, 0));
+          restOffsets[childName] = vecScale(sum, 1 / vectors.length);
+        } else {
+          restOffsets[childName] = vec3(0, 0.3, 0); // fallback
+        }
+      });
+
+      return restOffsets;
+    }
+
+    function buildHierarchy(restOffsets) {
+      function jointToBVH(name, indent) {
+        const spec = SKELETON_HIERARCHY.find(j => j.name === name);
+        if (!spec) return '';
+
+        const lines = [];
+        const pad = '  '.repeat(indent);
+
+        if (spec.parent === null) {
+          lines.push(`${pad}ROOT ${name}`);
+          lines.push(`${pad}{`);
+          lines.push(`${pad}  OFFSET 0.0 0.0 0.0`);
+          lines.push(`${pad}  CHANNELS 6 Xposition Yposition Zposition Zrotation Xrotation Yrotation`);
+        }
+        else {
+          lines.push(`${pad}JOINT ${name}`);
+          lines.push(`${pad}{`);
+          const off = restOffsets[name] || vec3(0, 0, 0);
+          lines.push(`${pad}  OFFSET ${off.x.toFixed(6)} ${off.y.toFixed(6)} ${off.z.toFixed(6)}`);
+          lines.push(`${pad}  CHANNELS 3 Zrotation Xrotation Yrotation`);
+        }
+
+        const children = SKELETON_HIERARCHY.filter(j => j.parent === name);
+        if (children.length === 0) {
+          const endOff = vecScale(vecNormalize(restOffsets[name] || vec3(0, 1, 0)), 0.05);
+          lines.push(`${pad}  End Site`);
+          lines.push(`${pad}  {`);
+          lines.push(`${pad}    OFFSET ${endOff.x.toFixed(6)} ${endOff.y.toFixed(6)} ${endOff.z.toFixed(6)}`);
+          lines.push(`${pad}  }`);
+        } else {
+          children.forEach(ch => {
+            lines.push(jointToBVH(ch.name, indent + 1));
+          });
+        }
+
+        lines.push(`${pad}}`);
+        return lines.join('\n');
+      }
+
+      return jointToBVH('pelvis', 0);
+    }
+
+    function calculateFrameTime() {
+      const times = recordedFrames.map(f => f.time);
+      const diffs = [];
+      for (let i = 1; i < times.length; i++) {
+        diffs.push(times[i] - times[i - 1]);
+      }
+      diffs.sort((a, b) => a - b);
+      return diffs.length ? diffs[Math.floor(diffs.length / 2)] : 1 / 30;
+    }
+
+    function calculateRotations(worldFrames, restOffsets) {
+      return worldFrames.map(wf => {
+        const localRots = {};
+        const parentWorldRot = { pelvis: quatIdentity() };
+
+        const rootQuat = calculateRootRotation(wf);
+        localRots['pelvis'] = rootQuat;
+        parentWorldRot['pelvis'] = rootQuat;
+
+        for (let i = 1; i < SKELETON_HIERARCHY.length; i++) {
+          const spec = SKELETON_HIERARCHY[i];
+          const parentPos = wf.joints[spec.parent];
+          const childPos = wf.joints[spec.name];
+
+          let localRot = quatIdentity();
+          if (parentPos && childPos) {
+            localRot = calculateJointRotation(
+              parentPos,
+              childPos,
+              restOffsets[spec.name],
+              parentWorldRot[spec.parent] || quatIdentity()
+            );
+          }
+
+          localRots[spec.name] = localRot;
+          parentWorldRot[spec.name] = quatMultiply(
+            parentWorldRot[spec.parent] || quatIdentity(),
+            localRot
+          );
+        }
+
+        const euler = {};
+        SKELETON_HIERARCHY.forEach(j => {
+          const q = localRots[j.name] || quatIdentity();
+          euler[j.name] = quatToEulerZXY(q);
+        });
+        return euler;
+      });
+    }
+
+    function calculateRootRotation(wf) {
+      const pelvis = wf.joints['pelvis'];
+      const chest = wf.joints['chest'];
+      const lHip = wf.joints['left_hip'];
+      const rHip = wf.joints['right_hip'];
+
+      if (!pelvis || !chest || !lHip || !rHip) {
+        return quatIdentity();
+      }
+
+      const forward = vecNormalize(vecSub(chest, pelvis));
+      const right = vecNormalize(vecSub(rHip, lHip));
+
+      if (vecLength(forward) < 0.01 || vecLength(right) < 0.01) {
+        return quatIdentity();
+      }
+
+      let up = vecCross(right, forward);
+      if (vecLength(up) < 0.01) {
+        return quatIdentity();
+      }
+
+      up = vecNormalize(up);
+      const forwardCorrected = vecNormalize(vecCross(up, right));
+
+      let baseQuat = quatFromBasis(right, up, forwardCorrected);
+
+      // ADDED: Extract yaw from 2D shoulder width for better rotation around vertical axis
+      if (wf.rawLandmarks2D) {
+        const lm = wf.rawLandmarks2D;
+        const lShoulder = lm[11];
+        const rShoulder = lm[12];
+
+        if (lShoulder && rShoulder && lShoulder.score >= LOW_CONFIDENCE && rShoulder.score >= LOW_CONFIDENCE) {
+          const shoulderWidth2D = Math.abs(rShoulder.x - lShoulder.x);
+
+          const estimatedMaxShoulderWidth = shoulderWidth2D * 1.2;
+
+          const shoulderRatio = Math.max(0.1, Math.min(1.0, shoulderWidth2D / estimatedMaxShoulderWidth));
+          const yawRadians = Math.acos(shoulderRatio);
+
+          const shoulderCenterX = (lShoulder.x + rShoulder.x) / 2;
+          const hipCenterX = (lm[23] && lm[24])
+            ? (lm[23].x + lm[24].x) / 2
+            : shoulderCenterX;
+          const yawSign = shoulderCenterX > hipCenterX ? 1 : -1;
+
+          const signedYaw = yawRadians * yawSign;
+
+          const yawQuat = {
+            w: Math.cos(signedYaw / 2),
+            x: 0,
+            y: Math.sin(signedYaw / 2),
+            z: 0
+          };
+
+          baseQuat = quatMultiply(baseQuat, yawQuat);
+        }
+      }
+
+      return baseQuat;
+    }
+
+    function calculateJointRotation(parentPos, childPos, restOffset, parentWorldRot) {
+      const parentRotInv = quatConjugate(parentWorldRot);
+
+      const currentBoneWorld = vecNormalize(vecSub(childPos, parentPos));
+      const restBone = vecNormalize(restOffset || vec3(0, 1, 0));
+
+      const currentBoneLocal = quatRotate(parentRotInv, currentBoneWorld);
+
+      return quatFromTwoVectors(restBone, currentBoneLocal);
+    }
+
+    function buildMotionLines(worldFrames, rotationFrames) {
+      const firstPelvis = worldFrames[0].joints['pelvis'] || vec3(0, 0, 0);
+
+      return worldFrames.map((wf, idx) => {
+        const e = rotationFrames[idx];
+        const pelvis = wf.joints['pelvis'] || vec3(0, 0, 0);
+
+        const rootPos = vec3(
+          pelvis.x - firstPelvis.x,
+          pelvis.y - firstPelvis.y,
+          pelvis.z - firstPelvis.z
+        );
+
+        let line = `${rootPos.x.toFixed(6)} ${rootPos.y.toFixed(6)} ${rootPos.z.toFixed(6)}`;
+        line += ` ${e['pelvis'].z.toFixed(6)} ${e['pelvis'].x.toFixed(6)} ${e['pelvis'].y.toFixed(6)}`;
+
+        for (let i = 1; i < SKELETON_HIERARCHY.length; i++) {
+          const name = SKELETON_HIERARCHY[i].name;
+          const r = e[name];
+          line += ` ${r.z.toFixed(6)} ${r.x.toFixed(6)} ${r.y.toFixed(6)}`;
+        }
+
+        return line;
+      });
+    }
+
+    // ==================== ADDED: MiDaS ONNX / Metric Depth Functions ====================
+
+    /* ADDED: MiDaS video seek helper */
+    function seekVideoToTime(videoEl, timeSec) {
+      return new Promise((resolve, reject) => {
+        const target = Math.min(Math.max(timeSec, 0), videoEl.duration || 0);
+        if (Math.abs(videoEl.currentTime - target) < 1e-4) {
+          resolve();
+          return;
+        }
+        const onSeeked = () => { cleanup(); resolve(); };
+        const onError = () => { cleanup(); reject(new Error('seek failed')); };
+        const timeout = setTimeout(() => { cleanup(); reject(new Error('seek timeout')); }, 5000);
+        const cleanup = () => {
+          clearTimeout(timeout);
+          videoEl.removeEventListener('seeked', onSeeked);
+          videoEl.removeEventListener('error', onError);
+        };
+        videoEl.addEventListener('seeked', onSeeked);
+        videoEl.addEventListener('error', onError);
+        videoEl.currentTime = target;
+      });
+    }
+
+    /* ADDED: MiDaS intrinsics helper */
+    function getCameraIntrinsics() {
+      const w = video.videoWidth || canvas.width || 1280;
+      const h = video.videoHeight || canvas.height || 720;
+      const fovDeg = parseFloat(cameraFovInput.value) || 60;
+      const fx = (w / 2) / Math.tan((fovDeg * Math.PI / 180) / 2);
+      const fy = fx;
+      return { fx, fy, cx: w / 2, cy: h / 2, width: w, height: h };
+    }
+
+    /* ADDED: MiDaS unproject pixel to camera (meters, right/down/forward) */
+    function unprojectPixelToCamera(u, v, Z, intr) {
+      const px = u * intr.width;
+      const py = v * intr.height;
+      return vec3(
+        (px - intr.cx) * Z / intr.fx,
+        (py - intr.cy) * Z / intr.fy,
+        Z
+      );
+    }
+
+    /* ADDED: MiDaS bilinear depth sampler */
+    function sampleDepth(depthObj, u, v) {
+      if (!depthObj || !depthObj.data || !depthObj.width || !depthObj.height) return null;
+      const x = Math.min(depthObj.width - 1, Math.max(0, u * depthObj.width - 0.5));
+      const y = Math.min(depthObj.height - 1, Math.max(0, v * depthObj.height - 0.5));
+      const x0 = Math.floor(x), y0 = Math.floor(y);
+      const x1 = Math.min(depthObj.width - 1, x0 + 1);
+      const y1 = Math.min(depthObj.height - 1, y0 + 1);
+      const dx = x - x0, dy = y - y0;
+      const i00 = y0 * depthObj.width + x0;
+      const i10 = y0 * depthObj.width + x1;
+      const i01 = y1 * depthObj.width + x0;
+      const i11 = y1 * depthObj.width + x1;
+      return (
+        depthObj.data[i00] * (1 - dx) * (1 - dy) +
+        depthObj.data[i10] * dx * (1 - dy) +
+        depthObj.data[i01] * (1 - dx) * dy +
+        depthObj.data[i11] * dx * dy
+      );
+    }
+
+    /* ADDED: MiDaS ONNX estimator */
+    async function estimateDepthMapONNXForVideoFrame(videoEl, session, modelSize = 256) {
+      if (!videoEl || !session || !window.ort) {
+        throw new Error('MiDaS estimator or session not available');
+      }
+      if (!videoEl.videoWidth || !videoEl.videoHeight) {
+        throw new Error('Video dimensions not ready');
+      }
+
+      // Reuse a small offscreen canvas for model input
+      if (!window._midasCanvas) {
+        window._midasCanvas = document.createElement('canvas');
+        window._midasCtx = window._midasCanvas.getContext('2d');
+      }
+      const mc = window._midasCanvas;
+      const mctx = window._midasCtx;
+      if (mc.width !== modelSize) mc.width = modelSize;
+      if (mc.height !== modelSize) mc.height = modelSize;
+      mctx.drawImage(videoEl, 0, 0, modelSize, modelSize);
+
+      const imageData = mctx.getImageData(0, 0, modelSize, modelSize);
+      const data = imageData.data;
+      const chw = new Float32Array(3 * modelSize * modelSize);
+      const mean = [0.485, 0.456, 0.406];
+      const std = [0.229, 0.224, 0.225];
+      const area = modelSize * modelSize;
+      for (let i = 0; i < area; i++) {
+        chw[i] = (data[i * 4] / 255 - mean[0]) / std[0];
+        chw[area + i] = (data[i * 4 + 1] / 255 - mean[1]) / std[1];
+        chw[2 * area + i] = (data[i * 4 + 2] / 255 - mean[2]) / std[2];
+      }
+
+      const inputName = session.inputNames[0];
+      const inputTensor = new ort.Tensor('float32', chw, [1, 3, modelSize, modelSize]);
+      const feeds = { [inputName]: inputTensor };
+      const results = await session.run(feeds);
+      const outputName = session.outputNames[0];
+      const output = results[outputName];
+      if (!output) throw new Error('MiDaS ONNX output missing');
+      const dims = output.dims || [];
+      let H = modelSize, W = modelSize;
+      if (dims.length >= 4) { H = dims[2]; W = dims[3]; }
+      else if (dims.length === 3) { H = dims[1]; W = dims[2]; }
+      else if (dims.length === 2) { H = dims[0]; W = dims[1]; }
+      const flat = new Float32Array(output.data);
+      let start = flat.length - H * W;
+      if (start < 0) start = 0;
+      const modelMap = flat.slice(start, start + H * W);
+
+      // Upsample bilinear to full video resolution
+      const vw = videoEl.videoWidth;
+      const vh = videoEl.videoHeight;
+      const outData = new Float32Array(vw * vh);
+      const scaleX = W / vw;
+      const scaleY = H / vh;
+      for (let y = 0; y < vh; y++) {
+        const sy = Math.min(H - 1, Math.max(0, (y + 0.5) * scaleY - 0.5));
+        const y0 = Math.floor(sy), y1 = Math.min(H - 1, y0 + 1);
+        const dy = sy - y0;
+        for (let x = 0; x < vw; x++) {
+          const sx = Math.min(W - 1, Math.max(0, (x + 0.5) * scaleX - 0.5));
+          const x0 = Math.floor(sx), x1 = Math.min(W - 1, x0 + 1);
+          const dx = sx - x0;
+          const i00 = y0 * W + x0;
+          const i10 = y0 * W + x1;
+          const i01 = y1 * W + x0;
+          const i11 = y1 * W + x1;
+          outData[y * vw + x] =
+            modelMap[i00] * (1 - dx) * (1 - dy) +
+            modelMap[i10] * dx * (1 - dy) +
+            modelMap[i01] * (1 - dx) * dy +
+            modelMap[i11] * dx * dy;
+        }
+      }
+
+      return { data: outData, width: vw, height: vh };
+    }
+
+    /* ADDED: MiDaS model loader */
+    async function loadMiDaSModel() {
+      if (!window.ort) {
+        statusEl.textContent = 'ONNX Runtime Web not loaded. Check script tag/network.';
+        statusEl.className = 'status-box error';
+        return;
+      }
+      if (!MIDAS_ONNX_URL || MIDAS_ONNX_URL.startsWith('<')) {
+        statusEl.textContent = 'MIDAS_ONNX_URL is not configured. Set the placeholder in the code.';
+        statusEl.className = 'status-box error';
+        return;
+      }
+      statusEl.textContent = 'Loading MiDaS ONNX model...';
+      statusEl.className = 'status-box';
+      try {
+        midasSession = await ort.InferenceSession.create(MIDAS_ONNX_URL, { executionProviders: ['wasm'] });
+        statusEl.textContent = 'MiDaS model loaded. You can use the depth checkbox.';
+        statusEl.className = 'status-box success';
+      } catch (err) {
+        console.error('MiDaS load error:', err);
+        statusEl.textContent = 'Failed to load MiDaS model: ' + err.message;
+        statusEl.className = 'status-box error';
+        midasSession = null;
+      }
+    }
+
+    /* ADDED: MiDaS metric world frame builder */
+    async function buildWorldFramesFromMiDaS(recordedFrames, session, intr) {
+      if (!recordedFrames || !recordedFrames.length) return null;
+      const knownHeight = TARGET_HEIGHT;
+      if (!Number.isFinite(knownHeight) || knownHeight <= 0) return null;
+
+      const validFrames = recordedFrames.filter(f => f.rawLandmarks2D && f.rawLandmarks2D[0] && (f.rawLandmarks2D[27] || f.rawLandmarks2D[28]));
+      if (!validFrames.length) {
+        console.debug('MiDaS: no frames with head/ankle keypoints.');
+        return null;
+      }
+
+      // First pass: robust global scale from a subset of valid frames
+      const subsetSize = Math.min(MIDAS_DEPTH_SUBSET, validFrames.length);
+      const step = Math.max(1, Math.floor(validFrames.length / subsetSize));
+      const ratios = [];
+      for (let i = 0; i < validFrames.length && ratios.length < subsetSize; i += step) {
+        const frame = validFrames[i];
+        try {
+          await seekVideoToTime(video, frame.time);
+          const depthObj = await estimateDepthMapONNXForVideoFrame(video, session, MIDAS_MODEL_SIZE);
+          const head = frame.rawLandmarks2D[0];
+          let ankle = frame.rawLandmarks2D[27];
+          if (!ankle || ankle.score < LOW_CONFIDENCE) ankle = frame.rawLandmarks2D[28];
+          if (!ankle || head.score < LOW_CONFIDENCE) continue;
+          const dHead = sampleDepth(depthObj, head.x, head.y);
+          const dAnkle = sampleDepth(depthObj, ankle.x, ankle.y);
+          if (dHead == null || dAnkle == null || !Number.isFinite(dHead) || !Number.isFinite(dAnkle)) continue;
+          const diff = Math.abs(dHead - dAnkle);
+          if (diff < 1e-6) continue;
+          ratios.push(knownHeight / diff);
+        } catch (err) {
+          console.debug('MiDaS scale sample failed:', err);
+        }
+      }
+      if (!ratios.length) {
+        console.debug('MiDaS: could not compute global scale.');
+        return null;
+      }
+      const globalScale = median(ratios);
+      if (!Number.isFinite(globalScale) || globalScale <= 0) return null;
+
+      // Second pass: unproject all frames
+      const worldFrames = [];
+      for (let idx = 0; idx < recordedFrames.length; idx++) {
+        const frame = recordedFrames[idx];
+        const wf = { time: frame.time, joints: {}, rawLandmarks2D: frame.rawLandmarks2D };
+        try {
+          await seekVideoToTime(video, frame.time);
+          const depthObj = await estimateDepthMapONNXForVideoFrame(video, session, MIDAS_MODEL_SIZE);
+          const landmarks = [];
+          if (frame.rawLandmarks2D) {
+            for (let i = 0; i < frame.rawLandmarks2D.length; i++) {
+              const kp = frame.rawLandmarks2D[i];
+              const conf = kp.score ?? 0;
+              let cam = null;
+              if (conf >= LOW_CONFIDENCE) {
+                const d = sampleDepth(depthObj, kp.x, kp.y);
+                if (d != null && Number.isFinite(d) && d > 0) {
+                  const Z = globalScale * d;
+                  const p = unprojectPixelToCamera(kp.x, kp.y, Z, intr);
+                  cam = { x: p.x, y: p.y, z: p.z, confidence: conf };
+                }
+              }
+              landmarks.push(cam || { x: 0, y: 0, z: 0, confidence: conf });
+            }
+          } else {
+            landmarks.length = 33;
+            for (let i = 0; i < 33; i++) landmarks[i] = { x: 0, y: 0, z: 0, confidence: 0 };
+          }
+          const skeleton3D = computeSkeleton3D(landmarks, true);
+          skeleton3D.forEach(j => {
+            if (j.position) {
+              wf.joints[j.name] = blazePoseToBVH(vec3(j.position.x, j.position.y, j.position.z));
+            } else {
+              wf.joints[j.name] = null;
+            }
+          });
+        } catch (err) {
+          console.debug('MiDaS unproject frame failed:', idx, err);
+          // leave joints null for this frame
+        }
+        worldFrames.push(wf);
+      }
+      return worldFrames;
+    }
+
+    /* ADDED: MiDaS OneEuro temporal smoothing */
+    class OneEuroFilter {
+      constructor(minCutoff = 1.0, beta = 0.0, dCutoff = 1.0) {
+        this.minCutoff = minCutoff;
+        this.beta = beta;
+        this.dCutoff = dCutoff;
+        this.x = null;
+        this.dx = null;
+        this.lastT = null;
+      }
+      alpha(cutoff, dt) {
+        const tau = 1 / (2 * Math.PI * cutoff);
+        return 1 / (1 + tau / dt);
+      }
+      reset() {
+        this.x = null;
+        this.dx = null;
+        this.lastT = null;
+      }
+      filter(t, x) {
+        if (this.x == null) {
+          this.x = x;
+          this.dx = 0;
+          this.lastT = t;
+          return x;
+        }
+        const dt = t - this.lastT;
+        if (dt <= 0) {
+          this.lastT = t;
+          return this.x;
+        }
+        const dx = (x - this.x) / dt;
+        const edx = this.dx == null ? dx : this.dx;
+        const alpha = this.alpha(this.minCutoff, dt);
+        const dAlpha = this.alpha(this.dCutoff, dt);
+        const dxFilt = edx + dAlpha * (dx - edx);
+        const cutoff = this.minCutoff + this.beta * Math.abs(dxFilt);
+        const a = this.alpha(cutoff, dt);
+        this.x = this.x + a * (x - this.x);
+        this.dx = dxFilt;
+        this.lastT = t;
+        return this.x;
+      }
+    }
+
+    function smoothWorldFrames(worldFrames) {
+      const filters = {};
+      SKELETON_HIERARCHY.forEach(j => {
+        filters[j.name] = {
+          x: new OneEuroFilter(0.8, 0.05, 1.0),
+          y: new OneEuroFilter(0.8, 0.05, 1.0),
+          z: new OneEuroFilter(0.8, 0.05, 1.0)
+        };
+      });
+
+      return worldFrames.map(wf => {
+        const smoothedJoints = {};
+        for (const name in wf.joints) {
+          const p = wf.joints[name];
+          if (p && filters[name]) {
+            const x = filters[name].x.filter(wf.time, p.x);
+            const y = filters[name].y.filter(wf.time, p.y);
+            const z = filters[name].z.filter(wf.time, p.z);
+            smoothedJoints[name] = vec3(x, y, z);
+          } else {
+            smoothedJoints[name] = null;
+            if (filters[name]) {
+              filters[name].x.reset();
+              filters[name].y.reset();
+              filters[name].z.reset();
+            }
+          }
+        }
+        return { ...wf, joints: smoothedJoints };
+      });
+    }
+
+    // ==================== ADDED: BVH compute wrapper with fallback ====================
+    function computeBVHFromWorldFrames(worldFrames) {
+      if (!worldFrames || worldFrames.length < 2) return null;
+      const restOffsets = calculateRestOffsets(worldFrames);
+      const hierarchyStr = buildHierarchy(restOffsets);
+      const frameTime = calculateFrameTime();
+      const rotationFrames = calculateRotations(worldFrames, restOffsets);
+      const frameLines = buildMotionLines(worldFrames, rotationFrames);
+      return `HIERARCHY\n${hierarchyStr}\nMOTION\nFrames: ${worldFrames.length}\nFrame Time: ${frameTime.toFixed(6)}\n${frameLines.join('\n')}`;
+    }
+
+    async function computeBVH() {
+      if (recordedFrames.length < 2) return null;
+
+      let worldFrames = null;
+      let pipelineLabel = '';
+
+      if (useMiDaSCheckbox.checked && midasSession) {
+        video.pause();
+        statusEl.textContent = 'Using MiDaS metric pipeline...';
+        statusEl.className = 'status-box';
+        try {
+          const intr = getCameraIntrinsics();
+          worldFrames = await buildWorldFramesFromMiDaS(recordedFrames, midasSession, intr);
+          if (worldFrames) {
+            worldFrames = smoothWorldFrames(worldFrames);
+            pipelineLabel = 'Using MiDaS metric pipeline';
+          } else {
+            console.debug('MiDaS pipeline returned null; falling back.');
+            statusEl.textContent = 'MiDaS pipeline failed, falling back to relative BlazePose pipeline.';
+            statusEl.className = 'status-box error';
+            worldFrames = buildWorldFrames();
+            pipelineLabel = 'Falling back to relative BlazePose pipeline';
+          }
+        } catch (err) {
+          console.debug('MiDaS pipeline error:', err);
+          statusEl.textContent = 'MiDaS pipeline error: ' + err.message + ' Falling back...';
+          statusEl.className = 'status-box error';
+          worldFrames = buildWorldFrames();
+          pipelineLabel = 'Falling back to relative BlazePose pipeline';
+        }
+      } else {
+        worldFrames = buildWorldFrames();
+        pipelineLabel = 'Using relative BlazePose pipeline';
+      }
+
+      if (!worldFrames) return null;
+
+      const bvh = computeBVHFromWorldFrames(worldFrames);
+      if (bvh) {
+        statusEl.textContent = `${pipelineLabel}. BVH generated (${worldFrames.length} frames).`;
+        statusEl.className = 'status-box success';
+      }
+      return bvh;
+    }
+
+    // ==================== Event listeners for added controls ====================
+    useMiDaSCheckbox.addEventListener('change', () => {
+      if (useMiDaSCheckbox.checked && !midasSession) {
+        loadMiDaSModel();
+      }
+    });
+
+    // ==================== Export button handler (async) ====================
+    exportBvhBtn.addEventListener('click', async () => {
+      let bvh = null;
+      try {
+        bvh = await computeBVH();
+      } catch (err) {
+        console.error('BVH generation error:', err);
+        statusEl.textContent = 'BVH generation error: ' + err.message;
+        statusEl.className = 'status-box error';
+        return;
+      }
+      if (!bvh) {
+        statusEl.textContent = 'BVH generation failed: not enough data.';
+        statusEl.className = 'status-box error';
+        return;
+      }
+
+      const blob = new Blob([bvh], { type: 'text/plain' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'mocap.bvh';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+
+      statusEl.textContent = 'BVH exported successfully.';
+      statusEl.className = 'status-box success';
+    });
+
+    // ==================== Boot ====================
+    initPoseDetector();
+  </script>
+</body>
+</html>
