@@ -851,7 +851,7 @@
     // BlazePose: X right, Y up, Z toward camera (so forward is +Z).
     function blazeToBVH(p) {
       if (!p) return null;
-      return vec3(p.x, p.y, p.z);
+      return vec3(p.x, p.y, -p.z);
     }
 
     function finiteVec3(v) {
@@ -901,9 +901,44 @@
 
       const reference = frames[referenceIndex];
       const referencePelvis = getJoint(reference, 'pelvis');
+
+      // Use 2D pelvis displacement to recover global root translation.
+      // (BlazePose 3D origin is the hip midpoint, so 3D pelvis is always near origin.)
+      function get2DPelvis(lms) {
+        if (!lms || lms.length < 25) return null;
+        const lh = lms[23], rh = lms[24];
+        if (!lh || !rh || !Number.isFinite(lh.x) || !Number.isFinite(lh.y) ||
+            !Number.isFinite(rh.x) || !Number.isFinite(rh.y)) return null;
+        if ((lh.score ?? 0) < LOW_CONFIDENCE || (rh.score ?? 0) < LOW_CONFIDENCE) return null;
+        return { x: (lh.x + rh.x) / 2, y: (lh.y + rh.y) / 2 };
+      }
+
+      // Estimate meters-per-normalized-image-unit from 3D/2D hip width.
+      const scales = [];
+      for (const f of frames) {
+        const lms = f.rawLandmarks2D;
+        const lh3 = getJoint(f, 'left_hip');
+        const rh3 = getJoint(f, 'right_hip');
+        if (!lms || !lms[23] || !lms[24] || !lh3 || !rh3) continue;
+        const d2 = Math.hypot(lms[23].x - lms[24].x, lms[23].y - lms[24].y);
+        const d3 = vecLength(vecSub(rh3, lh3));
+        if (d2 > 1e-8 && d3 > 1e-8) scales.push(d3 / d2);
+      }
+      const rootScale = scales.length ? median(scales) : 1.0;
+
+      const ref2DPelvis = get2DPelvis(reference.rawLandmarks2D);
       frames.forEach(frame => {
         const pelvis = getJoint(frame, 'pelvis');
-        frame.rootTranslation = pelvis && referencePelvis ? vecSub(pelvis, referencePelvis) : vec3(0,0,0);
+        const current2DPelvis = get2DPelvis(frame.rawLandmarks2D);
+        if (ref2DPelvis && current2DPelvis) {
+          const dx = current2DPelvis.x - ref2DPelvis.x;
+          const dy = -(current2DPelvis.y - ref2DPelvis.y); // BVH Y is up
+          frame.rootTranslation = vec3(dx * rootScale, dy * rootScale, 0);
+        } else if (pelvis && referencePelvis) {
+          frame.rootTranslation = vecSub(pelvis, referencePelvis);
+        } else {
+          frame.rootTranslation = vec3(0, 0, 0);
+        }
       });
       return { frames, referenceIndex };
     }
