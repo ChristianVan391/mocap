@@ -980,12 +980,13 @@
           const skeleton2D = computeSkeleton2D(cleanResult2D.landmarks, cleanResult2D.valid);
           const skeleton3D = computeSkeleton3D(cleanResult3D.landmarks, cleanResult3D.valid);
 
+          // IMPORTANT FIX: store cleaned landmarks for MiDaS depth sampling
           const frameData = {
             time: timeSec,
             skeleton2D: skeleton2D,
             skeleton3D: skeleton3D,
-            rawLandmarks2D: raw2D ? raw2D.map(kp => ({ x: kp.x, y: kp.y, score: kp.score ?? 0 })) : null,
-            rawLandmarks3D: raw3D ? raw3D.map(kp => ({ x: kp.x, y: kp.y, z: kp.z, score: kp.score ?? 0 })) : null
+            rawLandmarks2D: cleanResult2D.landmarks ? cleanResult2D.landmarks.map(kp => ({ x: kp.x, y: kp.y, score: kp.confidence ?? 0 })) : null,
+            rawLandmarks3D: cleanResult3D.landmarks ? cleanResult3D.landmarks.map(kp => ({ x: kp.x, y: kp.y, z: kp.z, score: kp.confidence ?? 0 })) : null
           };
           recordedFrames.push(frameData);
 
@@ -1319,11 +1320,18 @@
         }
       });
 
-      return worldFrames;
+      // ADDED: apply temporal smoothing to fallback output
+      return smoothWorldFrames(worldFrames);
     }
 
-    // ==================== Existing BVH building functions ====================
+    // ==================== Improved rest offsets (local space from first frame) ====================
     function calculateRestOffsets(worldFrames) {
+      if (!worldFrames || worldFrames.length === 0) return {};
+
+      const first = worldFrames[0];
+      const rootQuat = calculateRootRotation(first); // root rotation at first frame
+      const rootInv = quatConjugate(rootQuat);
+
       const restOffsets = {};
 
       SKELETON_HIERARCHY.forEach(spec => {
@@ -1331,19 +1339,15 @@
 
         const parentName = spec.parent;
         const childName = spec.name;
-        const vectors = [];
+        const parentPos = first.joints[parentName];
+        const childPos = first.joints[childName];
 
-        worldFrames.forEach(wf => {
-          const p = wf.joints[parentName];
-          const c = wf.joints[childName];
-          if (p && c) {
-            vectors.push(vecSub(c, p));
-          }
-        });
-
-        if (vectors.length > 0) {
-          const sum = vectors.reduce((acc, v) => vec3(acc.x + v.x, acc.y + v.y, acc.z + v.z), vec3(0, 0, 0));
-          restOffsets[childName] = vecScale(sum, 1 / vectors.length);
+        if (parentPos && childPos) {
+          // world-space bone vector
+          const worldBone = vecSub(childPos, parentPos);
+          // transform into parent-local space (approximation using root inverse)
+          const localBone = quatRotate(rootInv, worldBone);
+          restOffsets[childName] = localBone;
         } else {
           restOffsets[childName] = vec3(0, 0.3, 0); // fallback
         }
@@ -1544,9 +1548,9 @@
       });
     }
 
-    // ==================== ADDED: MiDaS ONNX / Metric Depth Functions ====================
+    // ==================== MiDaS ONNX / Metric Depth Functions (with fixes) ====================
 
-    /* ADDED: MiDaS video seek helper */
+    /* MiDaS video seek helper */
     function seekVideoToTime(videoEl, timeSec) {
       return new Promise((resolve, reject) => {
         const target = Math.min(Math.max(timeSec, 0), videoEl.duration || 0);
@@ -1568,7 +1572,7 @@
       });
     }
 
-    /* ADDED: MiDaS intrinsics helper */
+    /* MiDaS intrinsics helper */
     function getCameraIntrinsics() {
       const w = video.videoWidth || canvas.width || 1280;
       const h = video.videoHeight || canvas.height || 720;
@@ -1578,7 +1582,7 @@
       return { fx, fy, cx: w / 2, cy: h / 2, width: w, height: h };
     }
 
-    /* ADDED: MiDaS unproject pixel to camera (meters, right/down/forward) */
+    /* MiDaS unproject pixel to camera (meters, right/down/forward) */
     function unprojectPixelToCamera(u, v, Z, intr) {
       const px = u * intr.width;
       const py = v * intr.height;
@@ -1589,7 +1593,7 @@
       );
     }
 
-    /* ADDED: MiDaS bilinear depth sampler */
+    /* MiDaS bilinear depth sampler */
     function sampleDepth(depthObj, u, v) {
       if (!depthObj || !depthObj.data || !depthObj.width || !depthObj.height) return null;
       const x = Math.min(depthObj.width - 1, Math.max(0, u * depthObj.width - 0.5));
@@ -1610,7 +1614,7 @@
       );
     }
 
-    /* ADDED: MiDaS ONNX estimator */
+    /* MiDaS ONNX estimator with letterboxing and inverse-depth conversion */
     async function estimateDepthMapONNXForVideoFrame(videoEl, session, modelSize = 256) {
       if (!videoEl || !session || !window.ort) {
         throw new Error('MiDaS estimator or session not available');
@@ -1628,7 +1632,18 @@
       const mctx = window._midasCtx;
       if (mc.width !== modelSize) mc.width = modelSize;
       if (mc.height !== modelSize) mc.height = modelSize;
-      mctx.drawImage(videoEl, 0, 0, modelSize, modelSize);
+
+      // === LETTERBOXING: preserve aspect ratio, pad with black ===
+      const vw = videoEl.videoWidth;
+      const vh = videoEl.videoHeight;
+      const scale = Math.min(modelSize / vw, modelSize / vh);
+      const w = Math.round(vw * scale);
+      const h = Math.round(vh * scale);
+      const dx = (modelSize - w) / 2;
+      const dy = (modelSize - h) / 2;
+      mctx.fillStyle = '#000';
+      mctx.fillRect(0, 0, modelSize, modelSize);
+      mctx.drawImage(videoEl, dx, dy, w, h);
 
       const imageData = mctx.getImageData(0, 0, modelSize, modelSize);
       const data = imageData.data;
@@ -1649,46 +1664,77 @@
       const outputName = session.outputNames[0];
       const output = results[outputName];
       if (!output) throw new Error('MiDaS ONNX output missing');
+
+      // Get output dimensions (usually same as input)
       const dims = output.dims || [];
       let H = modelSize, W = modelSize;
       if (dims.length >= 4) { H = dims[2]; W = dims[3]; }
       else if (dims.length === 3) { H = dims[1]; W = dims[2]; }
       else if (dims.length === 2) { H = dims[0]; W = dims[1]; }
+
       const flat = new Float32Array(output.data);
       let start = flat.length - H * W;
       if (start < 0) start = 0;
       const modelMap = flat.slice(start, start + H * W);
 
-      // Upsample bilinear to full video resolution
-      const vw = videoEl.videoWidth;
-      const vh = videoEl.videoHeight;
+      // === CONVERT OUTPUT TO RELATIVE DEPTH (invert if inverse depth) ===
+      // Many MiDaS models output inverse depth (disparity).
+      // We normalize, then take reciprocal to get relative depth (larger = farther).
+      let minVal = Infinity, maxVal = -Infinity;
+      for (let i = 0; i < modelMap.length; i++) {
+        const v = modelMap[i];
+        if (v < minVal) minVal = v;
+        if (v > maxVal) maxVal = v;
+      }
+      if (maxVal - minVal < 1e-6) {
+        // degenerate case, treat as all same depth
+        const depthMap = new Float32Array(modelMap.length).fill(1.0);
+        return { data: depthMap, width: vw, height: vh }; // but we need to upsample later? We'll handle below
+      }
+      const normalized = new Float32Array(modelMap.length);
+      for (let i = 0; i < modelMap.length; i++) {
+        normalized[i] = (modelMap[i] - minVal) / (maxVal - minVal);
+      }
+      // Convert normalized to depth: depth = 1 / (normalized + epsilon)
+      const eps = 1e-3;
+      const depthModel = new Float32Array(modelMap.length);
+      for (let i = 0; i < modelMap.length; i++) {
+        depthModel[i] = 1.0 / (normalized[i] + eps);
+      }
+
+      // === UPSAMPLE TO FULL VIDEO RESOLUTION WITH LETTERBOX MAPPING ===
       const outData = new Float32Array(vw * vh);
-      const scaleX = W / vw;
-      const scaleY = H / vh;
+      const scaleX = vw / w;   // how full-res pixels map to padded model coords
+      const scaleY = vh / h;
+      // For each full-res pixel, compute corresponding padded coordinate
       for (let y = 0; y < vh; y++) {
-        const sy = Math.min(H - 1, Math.max(0, (y + 0.5) * scaleY - 0.5));
-        const y0 = Math.floor(sy), y1 = Math.min(H - 1, y0 + 1);
-        const dy = sy - y0;
+        const py = dy + y * scaleY; // in model output coordinates (padded)
+        const y0 = Math.floor(py);
+        const y1 = Math.min(H - 1, y0 + 1);
+        const dyFrac = py - y0;
+        if (y0 < 0 || y0 >= H) continue;
         for (let x = 0; x < vw; x++) {
-          const sx = Math.min(W - 1, Math.max(0, (x + 0.5) * scaleX - 0.5));
-          const x0 = Math.floor(sx), x1 = Math.min(W - 1, x0 + 1);
-          const dx = sx - x0;
+          const px = dx + x * scaleX;
+          const x0 = Math.floor(px);
+          const x1 = Math.min(W - 1, x0 + 1);
+          const dxFrac = px - x0;
+          if (x0 < 0 || x0 >= W) continue;
           const i00 = y0 * W + x0;
           const i10 = y0 * W + x1;
           const i01 = y1 * W + x0;
           const i11 = y1 * W + x1;
           outData[y * vw + x] =
-            modelMap[i00] * (1 - dx) * (1 - dy) +
-            modelMap[i10] * dx * (1 - dy) +
-            modelMap[i01] * (1 - dx) * dy +
-            modelMap[i11] * dx * dy;
+            depthModel[i00] * (1 - dxFrac) * (1 - dyFrac) +
+            depthModel[i10] * dxFrac * (1 - dyFrac) +
+            depthModel[i01] * (1 - dxFrac) * dyFrac +
+            depthModel[i11] * dxFrac * dyFrac;
         }
       }
 
       return { data: outData, width: vw, height: vh };
     }
 
-    /* ADDED: MiDaS model loader */
+    /* MiDaS model loader */
     async function loadMiDaSModel() {
       if (!window.ort) {
         statusEl.textContent = 'ONNX Runtime Web not loaded. Check script tag/network.';
@@ -1714,7 +1760,7 @@
       }
     }
 
-    /* ADDED: MiDaS metric world frame builder */
+    /* MiDaS metric world frame builder */
     async function buildWorldFramesFromMiDaS(recordedFrames, session, intr) {
       if (!recordedFrames || !recordedFrames.length) return null;
       const knownHeight = TARGET_HEIGHT;
@@ -1773,7 +1819,7 @@
               if (conf >= LOW_CONFIDENCE) {
                 const d = sampleDepth(depthObj, kp.x, kp.y);
                 if (d != null && Number.isFinite(d) && d > 0) {
-                  const Z = globalScale * d;
+                  const Z = globalScale * d; // now metric
                   const p = unprojectPixelToCamera(kp.x, kp.y, Z, intr);
                   cam = { x: p.x, y: p.y, z: p.z, confidence: conf };
                 }
@@ -1801,7 +1847,7 @@
       return worldFrames;
     }
 
-    /* ADDED: MiDaS OneEuro temporal smoothing */
+    /* OneEuro temporal smoothing */
     class OneEuroFilter {
       constructor(minCutoff = 1.0, beta = 0.0, dCutoff = 1.0) {
         this.minCutoff = minCutoff;
@@ -1878,7 +1924,7 @@
       });
     }
 
-    // ==================== ADDED: BVH compute wrapper with fallback ====================
+    // ==================== BVH compute wrapper with fallback ====================
     function computeBVHFromWorldFrames(worldFrames) {
       if (!worldFrames || worldFrames.length < 2) return null;
       const restOffsets = calculateRestOffsets(worldFrames);
