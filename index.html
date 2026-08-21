@@ -663,79 +663,186 @@
         statusEl.className = 'status-box error';
         return;
       }
+    
       if (processing) return;
+    
       stopPreview();
       prevCleanedPose2D = null;
       prevCleanedPose3D = null;
+    
       processing = true;
       recordedFrames = [];
+    
       exportBvhBtn.disabled = true;
       startBtn.disabled = true;
       previewPlayBtn.disabled = true;
       previewStopBtn.disabled = true;
+    
       progressBar.style.width = '0%';
       frameCountEl.textContent = '0';
       videoTimeEl.textContent = '0.000s';
+    
       statusEl.className = 'status-box';
-      statusEl.textContent = 'Processing frames and building skeleton...';
-      video.currentTime = 0;
-      try { await video.play(); }
-      catch (e) {
-        statusEl.textContent = 'Error playing video: ' + e.message;
+      statusEl.textContent = 'Processing every source video frame...';
+    
+      video.pause();
+    
+      try {
+        await processAllVideoFrames();
+      } catch (err) {
+        console.error('Processing error:', err);
+        processing = false;
+        startBtn.disabled = false;
+        previewPlayBtn.disabled = false;
+        previewStopBtn.disabled = false;
+    
+        statusEl.textContent = 'Processing error: ' + err.message;
         statusEl.className = 'status-box error';
-        processing = false; startBtn.disabled = false; previewPlayBtn.disabled = false; previewStopBtn.disabled = false;
-        return;
       }
-      video.requestVideoFrameCallback(processVideoFrame);
-      const startStallTimer = () => {
-        if (stallTimeout) clearTimeout(stallTimeout);
-        stallTimeout = setTimeout(() => { if (processing) finalizeProcessing(); }, 5000);
-      };
-      startStallTimer();
-      window.resetStallTimer = startStallTimer;
     });
-
-    function processVideoFrame(now, metadata) {
-      if (!processing) return;
-      if (window.resetStallTimer) window.resetStallTimer();
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      const timeSec = metadata && metadata.mediaTime !== undefined ? metadata.mediaTime : video.currentTime;
-      poseDetector.estimatePoses(video, { flipHorizontal: false })
-        .then((poses) => {
-          if (!processing) return;
-          let raw2D = null, raw3D = null;
-          if (poses && poses.length > 0) { raw2D = poses[0].keypoints; raw3D = poses[0].keypoints3D || null; }
-          const clean2D = cleanPose2D(raw2D);
-          const clean3D = cleanPose3D(raw3D);
-          const skeleton2D = computeSkeleton2D(clean2D.landmarks, clean2D.valid);
-          const skeleton3D = computeSkeleton3D(clean3D.landmarks, clean3D.valid);
-          const frameData = {
-            time: timeSec,
-            skeleton2D,
-            skeleton3D,
-            rawLandmarks2D: clean2D.landmarks ? clean2D.landmarks.map(kp => ({ x: kp.x, y: kp.y, score: kp.confidence ?? 0 })) : null,
-            rawLandmarks3D: clean3D.landmarks ? clean3D.landmarks.map(kp => ({ x: kp.x, y: kp.y, z: kp.z, score: kp.confidence ?? 0 })) : null
-          };
-          recordedFrames.push(frameData);
-          drawSkeletonPreview(skeleton2D, clean2D.valid);
-          const progress = video.duration > 0 ? (video.currentTime / video.duration) * 100 : 0;
-          progressBar.style.width = progress.toFixed(1) + '%';
-          frameCountEl.textContent = recordedFrames.length;
-          videoTimeEl.textContent = timeSec.toFixed(3) + 's';
-          statusEl.textContent = `Frame ${recordedFrames.length} | t=${timeSec.toFixed(3)}s | ${progress.toFixed(1)}%`;
-          const epsilon = 0.05;
-          if (video.ended || video.currentTime >= video.duration - epsilon) { finalizeProcessing(); return; }
-          if (!video.paused && !video.ended) video.requestVideoFrameCallback(processVideoFrame);
-          else finalizeProcessing();
-        })
-        .catch(err => {
-          console.error('Detection error:', err);
-          finalizeProcessing();
-          statusEl.textContent = 'Detection error: ' + err.message;
-          statusEl.className = 'status-box error';
-        });
+    
+    
+    async function seekVideoTo(time) {
+      return new Promise((resolve, reject) => {
+        const onSeeked = () => {
+          cleanup();
+          resolve();
+        };
+    
+        const onError = () => {
+          cleanup();
+          reject(new Error('Video seek failed.'));
+        };
+    
+        const cleanup = () => {
+          video.removeEventListener('seeked', onSeeked);
+          video.removeEventListener('error', onError);
+        };
+    
+        video.addEventListener('seeked', onSeeked, { once: true });
+        video.addEventListener('error', onError, { once: true });
+    
+        video.currentTime = Math.max(
+          0,
+          Math.min(time, Math.max(0, video.duration - 0.0001))
+        );
+      });
     }
-
+    
+    
+    async function processAllVideoFrames() {
+      /*
+       * Determine the source video's frame rate.
+       *
+       * 30 FPS is used as the fallback because browser video metadata
+       * does not always expose the exact encoded frame rate.
+       */
+      const fps = 30;
+      const frameTime = 1 / fps;
+    
+      const totalFrames = Math.max(
+        1,
+        Math.round(video.duration * fps)
+      );
+    
+      for (let frameIndex = 0; frameIndex < totalFrames; frameIndex++) {
+        if (!processing) return;
+    
+        const targetTime = Math.min(
+          frameIndex * frameTime,
+          Math.max(0, video.duration - 0.0001)
+        );
+    
+        await seekVideoTo(targetTime);
+    
+        if (!processing) return;
+    
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    
+        let poses = null;
+    
+        try {
+          poses = await poseDetector.estimatePoses(video, {
+            flipHorizontal: false
+          });
+        } catch (err) {
+          console.error(`Pose detection failed at frame ${frameIndex}:`, err);
+          poses = null;
+        }
+    
+        if (!processing) return;
+    
+        let raw2D = null;
+        let raw3D = null;
+    
+        if (poses && poses.length > 0) {
+          raw2D = poses[0].keypoints;
+          raw3D = poses[0].keypoints3D || null;
+        }
+    
+        const clean2D = cleanPose2D(raw2D);
+        const clean3D = cleanPose3D(raw3D);
+    
+        const skeleton2D = computeSkeleton2D(
+          clean2D.landmarks,
+          clean2D.valid
+        );
+    
+        const skeleton3D = computeSkeleton3D(
+          clean3D.landmarks,
+          clean3D.valid
+        );
+    
+        const frameData = {
+          time: targetTime,
+          skeleton2D,
+          skeleton3D,
+    
+          rawLandmarks2D: clean2D.landmarks
+            ? clean2D.landmarks.map(kp => ({
+                x: kp.x,
+                y: kp.y,
+                score: kp.confidence ?? 0
+              }))
+            : null,
+    
+          rawLandmarks3D: clean3D.landmarks
+            ? clean3D.landmarks.map(kp => ({
+                x: kp.x,
+                y: kp.y,
+                z: kp.z,
+                score: kp.confidence ?? 0
+              }))
+            : null
+        };
+    
+        recordedFrames.push(frameData);
+    
+        drawSkeletonPreview(
+          skeleton2D,
+          clean2D.valid
+        );
+    
+        const progress =
+          ((frameIndex + 1) / totalFrames) * 100;
+    
+        progressBar.style.width =
+          progress.toFixed(1) + '%';
+    
+        frameCountEl.textContent =
+          recordedFrames.length;
+    
+        videoTimeEl.textContent =
+          targetTime.toFixed(3) + 's';
+    
+        statusEl.textContent =
+          `Frame ${frameIndex + 1}/${totalFrames} | ` +
+          `t=${targetTime.toFixed(3)}s | ` +
+          `${progress.toFixed(1)}%`;
+      }
+    
+      finalizeProcessing();
+    }
     function drawSkeletonPreview(skeleton, frameValid) {
       if (video.readyState >= 2) ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
       if (!skeleton || skeleton.length === 0) return;
