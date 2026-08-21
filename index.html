@@ -1,23 +1,10 @@
 <!--
   BACKUP NOTE
   Timestamp: 2026-08-21T00:00:00Z
-  This version removes all MiDaS scaling hacks and fixes the BVH coordinate math.
-  It uses BlazePose's native 3D world coordinates, canonicalizes the root coordinate
-  frame, computes rest offsets from the first frame, and writes local rotations
-  consistently with the BVH hierarchy.
-
-  USAGE
-  1. Open this HTML from a local web server.
-  2. Load an MP4.
-  3. Click "Start Processing".
-  4. Click "Export BVH".
-  5. Import the resulting BVH into Blender.
-
-  The MiDaS checkbox is now a visible placeholder and does not affect output.
-
-  CHANGES IN THIS VERSION
-  - Fixed T-pose rest offsets are used instead of the first frame.
-  - Euler angles are unwrapped and smoothed to reduce jumps.
+  This version uses fixed BVH offsets from median bone lengths and anatomical axes.
+  No T-pose calibration. No first-frame dependence for skeleton structure.
+  Per-frame joint rotations are derived from actual joint positions.
+  MiDaS checkbox is a placeholder and does not affect output.
 -->
 
 <!DOCTYPE html>
@@ -962,7 +949,6 @@
     }
 
     // ==================== BVH Math Utilities ====================
-    // Primitive vector and quaternion helpers
     function vec3(x,y,z) { return {x,y,z}; }
     function vecSub(a,b) { return vec3(a.x-b.x, a.y-b.y, a.z-b.z); }
     function vecScale(a,s) { return vec3(a.x*s, a.y*s, a.z*s); }
@@ -1034,17 +1020,7 @@
       return sorted.length % 2 ? sorted[mid] : (sorted[mid-1]+sorted[mid])/2;
     }
 
-    // ==================== BVH Math Utilities (Replacement) ====================
-
-    // BlazePose world coordinates:
-    //   X = subject's right
-    //   Y = up
-    //   Z = depth, with camera-facing direction represented by negative Z.
-    //
-    // BVH/Blender coordinates used here:
-    //   X = right
-    //   Y = forward
-    //   Z = up
+    // ==================== Coordinate Conversion ====================
     function blazeToBVH(p) {
       if (!p) return null;
       return vec3(p.x, -p.z, p.y);
@@ -1054,104 +1030,9 @@
       return !!v && Number.isFinite(v.x) && Number.isFinite(v.y) && Number.isFinite(v.z);
     }
 
-    function safeVec3(v, fallback) {
-      return finiteVec3(v) ? v : (fallback ? vec3(fallback.x, fallback.y, fallback.z) : null);
-    }
-
-    function quatNormalize(q) {
-      const l = Math.sqrt(q.w*q.w + q.x*q.x + q.y*q.y + q.z*q.z);
-      if (!Number.isFinite(l) || l < 1e-10) return quatIdentity();
-      return { w: q.w / l, x: q.x / l, y: q.y / l, z: q.z / l };
-    }
-
-    function quatInverse(q) {
-      const n = q.w*q.w + q.x*q.x + q.y*q.y + q.z*q.z;
-      if (!Number.isFinite(n) || n < 1e-12) return quatIdentity();
-      return { w: q.w / n, x: -q.x / n, y: -q.y / n, z: -q.z / n };
-    }
-
-    function quatSlerp(a, b, t) {
-      a = quatNormalize(a);
-      b = quatNormalize(b);
-      let dot = a.w*b.w + a.x*b.x + a.y*b.y + a.z*b.z;
-      if (dot < 0) { b = { w: -b.w, x: -b.x, y: -b.y, z: -b.z }; dot = -dot; }
-      dot = Math.max(-1, Math.min(1, dot));
-      if (dot > 0.9995) {
-        return quatNormalize({
-          w: a.w + t*(b.w-a.w), x: a.x + t*(b.x-a.x), y: a.y + t*(b.y-a.y), z: a.z + t*(b.z-a.z)
-        });
-      }
-      const theta = Math.acos(dot);
-      const sinTheta = Math.sin(theta);
-      if (Math.abs(sinTheta) < 1e-8) return a;
-      const wa = Math.sin((1-t)*theta) / sinTheta;
-      const wb = Math.sin(t*theta) / sinTheta;
-      return { w: wa*a.w + wb*b.w, x: wa*a.x + wb*b.x, y: wa*a.y + wb*b.y, z: wa*a.z + wb*b.z };
-    }
-
-    // Build a right-handed orientation frame.
-    // Y is the primary anatomical axis.
-    // reference is used to establish the twist around Y.
-    function quatFromPrimaryAxis(primaryY, reference) {
-      const y = vecNormalize(primaryY);
-      if (vecLength(y) < 1e-8) return quatIdentity();
-
-      let x = vecSub(reference, vecScale(y, vecDot(reference, y)));
-      if (vecLength(x) < 1e-8) {
-        const candidate = Math.abs(y.z) < 0.8 ? vec3(0, 0, 1) : vec3(1, 0, 0);
-        x = vecSub(candidate, vecScale(y, vecDot(candidate, y)));
-      }
-      x = vecNormalize(x);
-      if (vecLength(x) < 1e-8) return quatIdentity();
-
-      let z = vecNormalize(vecCross(x, y));
-      if (vecLength(z) < 1e-8) return quatIdentity();
-
-      x = vecNormalize(vecCross(y, z));
-      return quatFromBasis(x, y, z);
-    }
-
     function getJoint(wf, name) {
       if (!wf || !wf.joints) return null;
       return finiteVec3(wf.joints[name]) ? wf.joints[name] : null;
-    }
-
-    function midpoint(a, b) {
-      if (!a || !b) return null;
-      return vecScale(vecAdd(a, b), 0.5);
-    }
-
-    function vecAdd(a, b) {
-      return vec3(a.x + b.x, a.y + b.y, a.z + b.z);
-    }
-
-    function getDirection(wf, aName, bName) {
-      const a = getJoint(wf, aName);
-      const b = getJoint(wf, bName);
-      if (!a || !b) return null;
-      const d = vecSub(b, a);
-      if (vecLength(d) < 1e-8) return null;
-      return vecNormalize(d);
-    }
-
-    function getBendReference(wf, jointName, childName, fallback) {
-      const joint = getJoint(wf, jointName);
-      const child = getJoint(wf, childName);
-      if (!joint || !child) return fallback || null;
-
-      const incomingName = SKELETON_HIERARCHY.find(j => j.name === jointName)?.parent;
-      if (!incomingName) return fallback || null;
-
-      const parent = getJoint(wf, incomingName);
-      if (!parent) return fallback || null;
-
-      const incoming = vecNormalize(vecSub(joint, parent));
-      const outgoing = vecNormalize(vecSub(child, joint));
-      if (vecLength(incoming) < 1e-8 || vecLength(outgoing) < 1e-8) return fallback || null;
-
-      const bendNormal = vecCross(incoming, outgoing);
-      if (vecLength(bendNormal) < 1e-8) return fallback || null;
-      return vecNormalize(bendNormal);
     }
 
     // ==================== World Frame Construction ====================
@@ -1210,184 +1091,27 @@
       return { frames, referenceIndex };
     }
 
-    // ==================== Stable Joint World Frames ====================
-    function computeJointWorldFrames(wf) {
-      const frames = {};
-
+    // ==================== Root Orientation ====================
+    function computeRootRotation(wf) {
       const pelvis = getJoint(wf, 'pelvis');
       const chest = getJoint(wf, 'chest');
       const leftHip = getJoint(wf, 'left_hip');
       const rightHip = getJoint(wf, 'right_hip');
-      const leftShoulder = getJoint(wf, 'left_shoulder');
-      const rightShoulder = getJoint(wf, 'right_shoulder');
-      const neck = getJoint(wf, 'neck');
-      const head = getJoint(wf, 'head');
 
-      if (pelvis && chest && leftHip && rightHip) {
-        const spine = vecNormalize(vecSub(chest, pelvis));
-        const right = vecNormalize(vecSub(rightHip, leftHip));
-        frames.pelvis = quatFromBasis(
-          right,
-          vecNormalize(vecCross(right, vecNormalize(spine))),
-          spine
-        );
-      }
+      if (!pelvis || !chest || !leftHip || !rightHip) return quatIdentity();
 
-      if (pelvis && chest && leftShoulder && rightShoulder) {
-        const spine = vecNormalize(vecSub(chest, pelvis));
-        const right = vecNormalize(vecSub(rightShoulder, leftShoulder));
-        frames.chest = quatFromBasis(
-          right,
-          vecNormalize(vecCross(right, spine)),
-          spine
-        );
-      }
+      const right = vecNormalize(vecSub(rightHip, leftHip));
+      const spine = vecNormalize(vecSub(chest, pelvis));
 
-      const pelvisQ = frames.pelvis || quatIdentity();
-      const chestQ = frames.chest || pelvisQ;
+      if (vecLength(right) < 1e-8 || vecLength(spine) < 1e-8) return quatIdentity();
 
-      const pelvisRight = quatRotate(pelvisQ, vec3(1,0,0));
-      const pelvisUp = quatRotate(pelvisQ, vec3(0,0,1));
-      const chestRight = quatRotate(chestQ, vec3(1,0,0));
-      const chestUp = quatRotate(chestQ, vec3(0,0,1));
+      const forward = vecNormalize(vecCross(spine, right));
+      const up = vecNormalize(vecCross(right, forward));
 
-      for (const side of ['left', 'right']) {
-        const hip = getJoint(wf, `${side}_hip`);
-        const knee = getJoint(wf, `${side}_knee`);
-        if (hip && knee) {
-          const thigh = vecNormalize(vecSub(knee, hip));
-          const ref = side === 'left' ? vecScale(pelvisRight, -1) : pelvisRight;
-          frames[`${side}_hip`] = quatFromPrimaryAxis(thigh, ref);
-        }
-      }
-
-      for (const side of ['left', 'right']) {
-        const hip = getJoint(wf, `${side}_hip`);
-        const knee = getJoint(wf, `${side}_knee`);
-        const ankle = getJoint(wf, `${side}_ankle`);
-        if (hip && knee && ankle) {
-          const thigh = vecNormalize(vecSub(knee, hip));
-          const shin = vecNormalize(vecSub(ankle, knee));
-          let bendNormal = vecCross(thigh, shin);
-          if (vecLength(bendNormal) < 1e-8) bendNormal = pelvisRight;
-          frames[`${side}_knee`] = quatFromPrimaryAxis(shin, bendNormal);
-        }
-      }
-
-      for (const side of ['left', 'right']) {
-        const ankle = getJoint(wf, `${side}_ankle`);
-        const foot = getJoint(wf, `${side}_foot`);
-        const knee = getJoint(wf, `${side}_knee`);
-        if (ankle) {
-          let footDir = null;
-          if (foot) footDir = vecNormalize(vecSub(foot, ankle));
-          else if (knee) footDir = vecNormalize(vecSub(ankle, knee));
-          if (footDir && vecLength(footDir) > 1e-8) {
-            frames[`${side}_ankle`] = quatFromPrimaryAxis(footDir, pelvisUp);
-          }
-        }
-      }
-
-      for (const side of ['left', 'right']) {
-        const ankle = getJoint(wf, `${side}_ankle`);
-        const foot = getJoint(wf, `${side}_foot`);
-        if (foot) {
-          let direction = null;
-          if (ankle) direction = vecNormalize(vecSub(foot, ankle));
-          if (!direction || vecLength(direction) < 1e-8) direction = pelvisUp;
-          frames[`${side}_foot`] = quatFromPrimaryAxis(direction, pelvisRight);
-        }
-      }
-
-      for (const side of ['left', 'right']) {
-        const shoulder = getJoint(wf, `${side}_shoulder`);
-        const elbow = getJoint(wf, `${side}_elbow`);
-        if (shoulder && elbow) {
-          const upperArm = vecNormalize(vecSub(elbow, shoulder));
-          const reference = side === 'left' ? vecScale(chestRight, -1) : chestRight;
-          frames[`${side}_shoulder`] = quatFromPrimaryAxis(upperArm, reference);
-        }
-      }
-
-      for (const side of ['left', 'right']) {
-        const shoulder = getJoint(wf, `${side}_shoulder`);
-        const elbow = getJoint(wf, `${side}_elbow`);
-        const wrist = getJoint(wf, `${side}_wrist`);
-        if (shoulder && elbow && wrist) {
-          const upperArm = vecNormalize(vecSub(elbow, shoulder));
-          const forearm = vecNormalize(vecSub(wrist, elbow));
-          let bendNormal = vecCross(upperArm, forearm);
-          if (vecLength(bendNormal) < 1e-8) bendNormal = chestRight;
-          frames[`${side}_elbow`] = quatFromPrimaryAxis(forearm, bendNormal);
-        }
-      }
-
-      for (const side of ['left', 'right']) {
-        const elbow = getJoint(wf, `${side}_elbow`);
-        const wrist = getJoint(wf, `${side}_wrist`);
-        if (elbow && wrist) {
-          const forearm = vecNormalize(vecSub(wrist, elbow));
-          frames[`${side}_wrist`] = quatFromPrimaryAxis(forearm, chestUp);
-        }
-      }
-
-      if (chest && neck) {
-        const neckDir = vecNormalize(vecSub(neck, chest));
-        frames.neck = quatFromPrimaryAxis(neckDir, chestRight);
-      }
-
-      if (neck && head) {
-        const headDir = vecNormalize(vecSub(head, neck));
-        frames.head = quatFromPrimaryAxis(headDir, chestRight);
-      }
-
-      for (const spec of SKELETON_HIERARCHY) {
-        if (!frames[spec.name]) {
-          if (spec.parent && frames[spec.parent]) frames[spec.name] = frames[spec.parent];
-          else frames[spec.name] = quatIdentity();
-        }
-      }
-
-      return frames;
+      return quatFromBasis(right, forward, up);
     }
 
-    // ==================== Root Orientation ====================
-    function computeRootRotation(wf) {
-      const frames = computeJointWorldFrames(wf);
-      return frames.pelvis || quatIdentity();
-    }
-
-    // ==================== Default T-Pose Rest Offsets ====================
-    // These are in BVH coordinates (X right, Y forward, Z up).
-    function getDefaultRestOffsets() {
-      return {
-        left_hip: vec3(-0.10, 0.00, -0.05),
-        left_knee: vec3(0.00, 0.00, -0.45),
-        left_ankle: vec3(0.00, 0.00, -0.45),
-        left_foot: vec3(0.00, 0.10, 0.00),
-        right_hip: vec3(0.10, 0.00, -0.05),
-        right_knee: vec3(0.00, 0.00, -0.45),
-        right_ankle: vec3(0.00, 0.00, -0.45),
-        right_foot: vec3(0.00, 0.10, 0.00),
-        chest: vec3(0.00, 0.00, 0.50),
-        left_shoulder: vec3(-0.15, 0.00, 0.10),
-        left_elbow: vec3(-0.30, 0.00, 0.00),
-        left_wrist: vec3(-0.25, 0.00, 0.00),
-        right_shoulder: vec3(0.15, 0.00, 0.10),
-        right_elbow: vec3(0.30, 0.00, 0.00),
-        right_wrist: vec3(0.25, 0.00, 0.00),
-        neck: vec3(0.00, 0.00, 0.10),
-        head: vec3(0.00, 0.00, 0.10),
-      };
-    }
-
-    // ==================== Rotation Computation ====================
-    function computeJointRotation(currentWorldRot, parentWorldRot) {
-      if (!currentWorldRot) return quatIdentity();
-      const parent = parentWorldRot || quatIdentity();
-      return quatNormalize(quatMultiply(quatInverse(parent), currentWorldRot));
-    }
-
+    // ==================== Local Rotation Computation ====================
     function quatToBVHZXY(q) {
       q = quatNormalize(q);
       const x = q.x, y = q.y, z = q.z, w = q.w;
@@ -1435,24 +1159,42 @@
       return result;
     }
 
-    function computeRotationsForFrame(wf, previousWorldFrames) {
-      const currentFrames = computeJointWorldFrames(wf);
-      const localRots = {};
+    function computeRotationsForFrame(wf, restOffsets, previousWorldRots) {
       const worldRots = {};
+      const localRots = {};
 
       for (const spec of SKELETON_HIERARCHY) {
         const name = spec.name;
-        const current = currentFrames[name];
-        let currentWorld = current || quatIdentity();
-        if (previousWorldFrames && !current) {
-          currentWorld = previousWorldFrames[name] || quatIdentity();
+        const parentName = spec.parent;
+
+        if (!parentName) {
+          const rootQuat = computeRootRotation(wf);
+          worldRots[name] = rootQuat;
+          localRots[name] = rootQuat;
+          continue;
         }
-        worldRots[name] = quatNormalize(currentWorld);
-        if (!spec.parent) {
-          localRots[name] = worldRots[name];
-        } else {
-          localRots[name] = computeJointRotation(worldRots[name], worldRots[spec.parent]);
+
+        const parentPos = getJoint(wf, parentName);
+        const childPos = getJoint(wf, name);
+        const parentWorldRot = worldRots[parentName] || quatIdentity();
+
+        let localRot = quatIdentity();
+        let worldRot = parentWorldRot;
+
+        if (parentPos && childPos) {
+          const currentWorldDir = vecNormalize(vecSub(childPos, parentPos));
+          if (vecLength(currentWorldDir) > 1e-8) {
+            const currentLocalDir = quatRotate(quatConjugate(parentWorldRot), currentWorldDir);
+            const restDir = vecNormalize(restOffsets[name] || vec3(0,0,1));
+            localRot = quatFromTwoVectors(restDir, currentLocalDir);
+            worldRot = quatMultiply(parentWorldRot, localRot);
+          }
+        } else if (previousWorldRots && previousWorldRots[name]) {
+          worldRot = previousWorldRots[name];
         }
+
+        worldRots[name] = quatNormalize(worldRot);
+        localRots[name] = quatNormalize(localRot);
       }
 
       const euler = {};
@@ -1507,6 +1249,63 @@
       return jointToBVH('pelvis', 0);
     }
 
+    // ==================== Fixed Rest Offsets from Median Lengths and Anatomical Directions ====================
+    function computeMedianBoneLengths(frames) {
+      const restOffsets = {};
+
+      // Canonical anatomical directions in parent‑local BVH space.
+      // X = right, Y = forward, Z = up.
+      const directions = {
+        left_hip: vec3(-1, 0, -0.3),
+        left_knee: vec3(0, 0, -1),
+        left_ankle: vec3(0, 0, -1),
+        left_foot: vec3(0, 1, 0),
+        right_hip: vec3(1, 0, -0.3),
+        right_knee: vec3(0, 0, -1),
+        right_ankle: vec3(0, 0, -1),
+        right_foot: vec3(0, 1, 0),
+        chest: vec3(0, 0, 1),
+        left_shoulder: vec3(-1, 0, 0.3),
+        left_elbow: vec3(-1, 0, 0),
+        left_wrist: vec3(-1, 0, 0),
+        right_shoulder: vec3(1, 0, 0.3),
+        right_elbow: vec3(1, 0, 0),
+        right_wrist: vec3(1, 0, 0),
+        neck: vec3(0, 0, 1),
+        head: vec3(0, 0, 1),
+      };
+
+      // Normalize each direction.
+      for (const name in directions) {
+        directions[name] = vecNormalize(directions[name]);
+      }
+
+      // Collect median bone length for each joint.
+      for (const spec of SKELETON_HIERARCHY) {
+        if (!spec.parent) continue;
+        const lengths = [];
+        for (const wf of frames) {
+          const parentPos = getJoint(wf, spec.parent);
+          const childPos = getJoint(wf, spec.name);
+          if (parentPos && childPos) {
+            const len = vecLength(vecSub(childPos, parentPos));
+            if (len > 1e-8) lengths.push(len);
+          }
+        }
+
+        if (lengths.length > 0) {
+          const medianLen = median(lengths);
+          const dir = directions[spec.name] || vec3(0,0,1);
+          restOffsets[spec.name] = vecScale(dir, medianLen);
+        } else {
+          // Fallback: use zero offset (will not affect rotation).
+          restOffsets[spec.name] = vec3(0,0,0);
+        }
+      }
+
+      return restOffsets;
+    }
+
     // ==================== Frame Timing ====================
     function calculateFrameTime() {
       const times = recordedFrames.map(f => Number(f.time)).filter(Number.isFinite);
@@ -1530,30 +1329,26 @@
       const SMOOTHING_FACTOR = 0.35;
 
       return frames.map(wf => {
-        const rotationData = computeRotationsForFrame(wf, previousWorldRots);
+        const rotationData = computeRotationsForFrame(wf, restOffsets, previousWorldRots);
         previousWorldRots = rotationData.worldRots;
 
         let e = rotationData.euler;
 
-        // Initialize previous Euler
         if (!previousEuler) {
           previousEuler = {};
           for (const spec of SKELETON_HIERARCHY) {
             previousEuler[spec.name] = { ...e[spec.name] };
           }
         } else {
-          // Unwrap and smooth each joint's Euler angles
           for (const spec of SKELETON_HIERARCHY) {
             const prev = previousEuler[spec.name];
             const curr = e[spec.name];
             if (prev && curr) {
-              // Unwrap current angles to be close to previous
               const unwrapped = {
                 x: curr.x + 360 * Math.round((prev.x - curr.x) / 360),
                 y: curr.y + 360 * Math.round((prev.y - curr.y) / 360),
                 z: curr.z + 360 * Math.round((prev.z - curr.z) / 360)
               };
-              // Smooth
               e[spec.name] = {
                 x: prev.x + SMOOTHING_FACTOR * (unwrapped.x - prev.x),
                 y: prev.y + SMOOTHING_FACTOR * (unwrapped.y - prev.y),
@@ -1564,7 +1359,6 @@
           }
         }
 
-        // Smooth root translation
         let rootPos = wf.rootTranslation || vec3(0,0,0);
         if (!previousRoot) {
           previousRoot = { ...rootPos };
@@ -1606,8 +1400,7 @@
     function computeBVHFromWorldFrames(worldData) {
       if (!worldData || !worldData.frames || worldData.frames.length < 2) return null;
 
-      // Use fixed T-pose rest offsets
-      const restOffsets = getDefaultRestOffsets();
+      const restOffsets = computeMedianBoneLengths(worldData.frames);
       const hierarchy = buildHierarchy(restOffsets);
       const frameTime = calculateFrameTime();
       const motionLines = buildMotionLines(worldData, restOffsets);
