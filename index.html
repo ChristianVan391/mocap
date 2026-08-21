@@ -349,9 +349,13 @@
   <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl"></script>
   <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose"></script>
-  <!-- ADDED: MiDaS ONNX Runtime Web -->
-  <script src="https://huggingface.co/Heliosoph/midas-small-onnx/resolve/main/midas_v21_small_256.onnx"></script>
-
+  
+  <!-- ONNX Runtime Web (runtime JS) - use local copy /libs/ort.min.js if you added it to the repo -->
+  <script src="/libs/ort.min.js"></script>
+  <!-- fallback to CDN if you prefer:
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+  -->
+  
   <script>
     // ==================== DOM Elements ====================
     const video = document.getElementById('video');
@@ -370,11 +374,11 @@
     const previewPlayBtn = document.getElementById('previewPlayBtn');
     const previewStopBtn = document.getElementById('previewStopBtn');
     const previewTime = document.getElementById('previewTime');
-
+  
     // ADDED: MiDaS DOM elements
     const cameraFovInput = document.getElementById('cameraFovInput');
     const useMiDaSCheckbox = document.getElementById('useMiDaSCheckbox');
-
+  
     // ==================== State ====================
     let poseDetector;
     let processing = false;
@@ -384,12 +388,61 @@
     let prevCleanedPose2D = null;   // array of 33 {x,y,confidence} or null
     let prevCleanedPose3D = null;   // array of 33 {x,y,z,confidence} or null
     let stallTimeout = null;
-
+  
     // ADDED: MiDaS state
     let midasSession = null;
-    const MIDAS_ONNX_URL = '<PLACEHOLDER_MIDAS_ONNX_URL>'; // developer must set hosted ONNX URL
-    const MIDAS_MODEL_SIZE = 256;   // configurable; common choices: 256, 384, 512
-    const MIDAS_DEPTH_SUBSET = 30;  // number of frames used to robustly estimate global scale
+    // Use a prebuilt hosted ONNX (Hugging Face). You can replace with your own same-origin URL later.
+    const MIDAS_ONNX_URL = 'https://huggingface.co/Heliosoph/midas-small-onnx/resolve/main/midas_v21_small_256.onnx';
+    const MIDAS_MODEL_SIZE = 256;   // input size you will render frames to before inference
+    const MIDAS_DEPTH_SUBSET = 30;  // number of frames used to estimate global scale
+  
+    // Minimal loader: fetch the .onnx as ArrayBuffer then create ort.InferenceSession
+    async function loadMiDaS(url) {
+      if (!window.ort) throw new Error('onnxruntime-web (ort) not loaded; make sure ort.min.js is included.');
+      statusEl && (statusEl.textContent = 'Fetching MiDaS model...');
+      try {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error('Fetch failed: ' + res.status + ' ' + res.statusText);
+        const buffer = await res.arrayBuffer();
+        // try WebGPU first (if supported), fallback to WASM
+        let session = null;
+        try {
+          session = await ort.InferenceSession.create(buffer, { executionProviders: ['webgpu'] });
+          console.log('MiDaS loaded with WebGPU');
+        } catch (e) {
+          console.warn('WebGPU load failed, falling back to WASM', e);
+          session = await ort.InferenceSession.create(buffer, { executionProviders: ['wasm'] });
+          console.log('MiDaS loaded with WASM');
+        }
+        midasSession = session;
+        statusEl && (statusEl.textContent = 'MiDaS model loaded');
+        console.log('MiDaS session inputNames:', session.inputNames, 'inputMetadata:', session.inputMetadata);
+        return session;
+      } catch (err) {
+        console.error('Failed to load MiDaS model', err);
+        midasSession = null;
+        statusEl && (statusEl.textContent = 'MiDaS load error: ' + (err.message || err));
+        throw err;
+      }
+    }
+  
+    // When user toggles the checkbox we lazy-load the model
+    if (useMiDaSCheckbox) {
+      useMiDaSCheckbox.addEventListener('change', async (ev) => {
+        const enabled = ev.target.checked;
+        if (enabled) {
+          try {
+            await loadMiDaS(MIDAS_ONNX_URL);
+          } catch (e) {
+            // disable checkbox on error
+            ev.target.checked = false;
+          }
+        } else {
+          midasSession = null;
+          statusEl && (statusEl.textContent = 'MiDaS disabled');
+        }
+      });
+    }
 
     // Skeleton hierarchy (with feet)
     const SKELETON_HIERARCHY = [
