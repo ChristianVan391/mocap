@@ -222,7 +222,7 @@
 <body>
   <header class="app-header">
     <div class="app-title">Mo<span>Cap</span></div>
-    <div class="app-version">BVH Export</div>
+    <div class="app-version">v1.0.0</div>
   </header>
 
   <div class="main-container">
@@ -1038,7 +1038,7 @@
         const pelvis = getJoint(frame, 'pelvis');
         const current2DPelvis = get2DPelvis(frame.rawLandmarks2D);
         if (ref2DPelvis && current2DPelvis) {
-          const dx = current2DPelvis.x - ref2DPelvis.x;
+          const dx = -(current2DPelvis.x - ref2DPelvis.x);
           const dy = -(current2DPelvis.y - ref2DPelvis.y); // BVH Y is up
           frame.rootTranslation = vec3(dx * rootScale, dy * rootScale, 0);
         } else if (pelvis && referencePelvis) {
